@@ -141,6 +141,16 @@ export interface BillingMutationResponse {
   retry_after?: number | null
 }
 
+export interface SubscriptionTierOption {
+  tier_id: string
+  name: string
+  tier_order: number                  // sorts the picker + upgrade/downgrade hint
+  dollars_per_month_display: string   // pre-formatted ($X / $X.YY)
+  monthly_credits: string | null
+  is_current: boolean                 // the active plan: shown, not selectable
+  is_enabled: boolean                 // false = grandfathered current tier
+}
+
 export interface SubscriptionStateResponse {
   ok: boolean
   logged_in: boolean
@@ -163,11 +173,58 @@ export interface SubscriptionStateResponse {
     cancellation_effective_at: string | null  // ISO when cancellation takes effect
     cancellation_effective_display: string | null  // formatted cancellation_effective_at
   } | null
+  tiers: SubscriptionTierOption[]  // selectable catalog for the in-terminal picker
   portal_url: string | null
   error?: string | null
   // Shared dollar usage model (two-bar view), embedded by the gateway so the
   // overlay renders the same bars as /usage from this single fetch.
   usage?: UsageModelData
+}
+
+// A chargeless quote (POST /subscription/preview) of what a change would do.
+// `effect` drives the confirm copy; a failed preview reuses the typed-error
+// envelope fields (same as the mutations) so a 403 still triggers the step-up.
+export interface SubscriptionPreviewResponse {
+  ok: boolean
+  effect?: 'charge_now' | 'scheduled' | 'no_op' | 'blocked'
+  reason?: string | null
+  current_tier_id?: string | null
+  current_tier_name?: string | null
+  target_tier_id?: string | null
+  target_tier_name?: string | null
+  monthly_credits_delta?: string | null
+  amount_due_now_cents?: number | null  // the prorated upfront charge for an upgrade
+  effective_at?: string | null          // ISO, when a scheduled change lands
+  // typed-error envelope (present when ok=false)
+  error?: string
+  message?: string
+  portal_url?: string | null
+  retry_after?: number | null
+  payload?: BillingErrorPayload
+  actor?: string
+  code?: string
+  recovery?: string
+}
+
+// The single money route (POST /subscription/upgrade). `status` distinguishes a
+// completed upgrade from an SCA/decline that must finish in the portal at
+// `recovery_url`. `idempotency_key` is echoed so a retry reuses it.
+export interface SubscriptionUpgradeResponse {
+  ok: boolean
+  status?: 'upgraded' | 'already_on_tier' | 'requires_action' | 'payment_failed'
+  target_tier_name?: string | null
+  recovery_url?: string | null
+  reason?: string | null
+  idempotency_key?: string
+  // typed-error envelope (present when ok=false)
+  error?: string
+  message?: string
+  portal_url?: string | null
+  retry_after?: number | null
+  payload?: BillingErrorPayload
+  actor?: string
+  code?: string
+  recovery?: string
 }
 
 export type CommandDispatchResponse =

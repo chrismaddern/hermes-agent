@@ -3,7 +3,7 @@ import type { MutableRefObject, ReactNode, RefObject, SetStateAction } from 'rea
 
 import type { PasteEvent } from '../components/textInput.js'
 import type { GatewayClient } from '../gatewayClient.js'
-import type { BillingStateResponse, ImageAttachResponse, SessionCloseResponse, SubscriptionStateResponse } from '../gatewayTypes.js'
+import type { BillingMutationResponse, BillingStateResponse, ImageAttachResponse, SessionCloseResponse, SubscriptionPreviewResponse, SubscriptionStateResponse, SubscriptionUpgradeResponse } from '../gatewayTypes.js'
 import type { ParsedVoiceRecordKey } from '../lib/platform.js'
 import type { RpcResult } from '../lib/rpc.js'
 import type { Theme } from '../theme.js'
@@ -150,23 +150,68 @@ export interface BillingOverlayState {
   state: BillingStateResponse
 }
 
-// ── Subscription overlay (deep-link only, NEVER charges in-terminal) ──
+// ── Subscription overlay (in-terminal plan change, V3) ──
 
-// Deep-link only: the overview hands off to the portal in the browser; there is
-// no in-terminal plan picker, so there is exactly one screen.
-export type SubscriptionScreen = 'overview'
+// A small state machine: overview → picker → confirm → result.
+//   overview — plan + status, entry to the picker / resume / manage-on-portal.
+//   picker   — the tier catalog (up/down direction hints; current tier shown,
+//              not selectable).
+//   confirm  — the previewed effect of the chosen change (charge $X now /
+//              scheduled at date / no-op / blocked) + the apply action.
+//   result   — the outcome, including an SCA/decline upgrade handed off to the
+//              portal.
+export type SubscriptionScreen = 'confirm' | 'overview' | 'picker' | 'result'
 
 export interface SubscriptionOverlayCtx {
   /** Build {portal}/manage-subscription?org_id=… locally and open it. Resolves ok/false. */
   openManageLink: () => Promise<boolean>
+  /** Open an arbitrary portal recovery URL (e.g. an upgrade's SCA handoff). */
+  openPortal: (url: string) => void
   /** Re-fetch subscription.state. */
   refreshState: () => Promise<SubscriptionStateResponse | null>
+  /** POST /preview a change to `tierId` → the chargeless effect quote (or typed error). */
+  preview: (tierId: string) => Promise<SubscriptionPreviewResponse | null>
+  /** PUT pending-change: schedule a downgrade / same-price change to `tierId`. */
+  scheduleChange: (tierId: string) => Promise<BillingMutationResponse | null>
+  /** PUT pending-change: schedule a cancellation at period end. */
+  scheduleCancellation: () => Promise<BillingMutationResponse | null>
+  /** DELETE pending-change: clear a scheduled downgrade / cancellation (resume). */
+  resume: () => Promise<BillingMutationResponse | null>
+  /** POST /upgrade: charge the card on the subscription + flip the plan now. */
+  upgrade: (tierId: string, idempotencyKey?: string) => Promise<SubscriptionUpgradeResponse | null>
   /** Emit a transcript system line. */
   sys: (text: string) => void
 }
 
+/** What the confirm screen is about to apply, plus its preview quote. */
+export interface SubscriptionPendingChange {
+  /** The target tier (null for a cancellation). */
+  targetTierId: string | null
+  /** How it will be applied — drives which ctx call confirm makes. */
+  kind: 'cancellation' | 'tier_change' | 'upgrade'
+  /** The preview quote shown on confirm (null = the quote call failed). */
+  preview?: null | SubscriptionPreviewResponse
+  /**
+   * Stable idempotency key for an upgrade charge, minted when confirm opens.
+   * Reused on retry so a re-submit dedups server-side.
+   */
+  idempotencyKey?: string
+}
+
+/** The outcome rendered on the result screen. */
+export interface SubscriptionResult {
+  message: string
+  ok: boolean
+  /** A portal URL to finish an SCA/declined upgrade, when present. */
+  recoveryUrl?: null | string
+}
+
 export interface SubscriptionOverlayState {
   ctx: SubscriptionOverlayCtx
+  /** Set on the 'confirm' screen: the change being confirmed + its preview. */
+  pending?: null | SubscriptionPendingChange
+  /** Set on the 'result' screen: the outcome to render. */
+  result?: null | SubscriptionResult
   screen: SubscriptionScreen
   state: SubscriptionStateResponse
 }

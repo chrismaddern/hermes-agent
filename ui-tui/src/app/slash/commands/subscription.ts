@@ -1,4 +1,9 @@
-import type { SubscriptionStateResponse } from '../../../gatewayTypes.js'
+import type {
+  BillingMutationResponse,
+  SubscriptionPreviewResponse,
+  SubscriptionStateResponse,
+  SubscriptionUpgradeResponse
+} from '../../../gatewayTypes.js'
 import { openExternalUrl } from '../../../lib/openExternalUrl.js'
 import type { SubscriptionOverlayCtx } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
@@ -65,19 +70,54 @@ const buildSubscriptionCtx = (
     const opened = openExternalUrl(url)
 
     if (opened) {
-      sys('Opening your subscription page in the browser — finish the change there; re-run /subscription to confirm.')
+      sys('Opening your subscription page in the browser — finish there, then re-run /subscription.')
     } else {
       sys('Could not open browser — visit your subscription page manually at ' + url)
     }
 
     return Promise.resolve(opened)
   },
+  openPortal: (url: string) => {
+    if (openExternalUrl(url)) {
+      sys('Opening the portal in your browser — finish there, then re-run /subscription.')
+    } else {
+      sys('Could not open browser — visit ' + url + ' to finish.')
+    }
+  },
+  preview: tierId =>
+    ctx.gateway
+      .rpc<SubscriptionPreviewResponse>('subscription.preview', { subscription_type_id: tierId })
+      .then(r => r ?? null)
+      .catch(() => null),
   refreshState: () =>
     ctx.gateway
       .rpc<SubscriptionStateResponse>('subscription.state', {})
       .then(r => r ?? null)
       .catch(() => null),
-  sys
+  resume: () =>
+    ctx.gateway
+      .rpc<BillingMutationResponse>('subscription.resume', {})
+      .then(r => r ?? null)
+      .catch(() => null),
+  scheduleCancellation: () =>
+    ctx.gateway
+      .rpc<BillingMutationResponse>('subscription.change', { cancel: true })
+      .then(r => r ?? null)
+      .catch(() => null),
+  scheduleChange: tierId =>
+    ctx.gateway
+      .rpc<BillingMutationResponse>('subscription.change', { subscription_type_id: tierId })
+      .then(r => r ?? null)
+      .catch(() => null),
+  sys,
+  upgrade: (tierId, idempotencyKey) =>
+    ctx.gateway
+      .rpc<SubscriptionUpgradeResponse>('subscription.upgrade', {
+        subscription_type_id: tierId,
+        ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {})
+      })
+      .then(r => r ?? null)
+      .catch(() => null)
 })
 
 export const subscriptionCommands: SlashCommand[] = [
