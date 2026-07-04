@@ -18,7 +18,7 @@ describe('virtual height estimates', () => {
   })
 
   it('uses compound user prompt width when estimating user message wrapping', () => {
-    const msg: Msg = { role: 'user', text: 'x'.repeat(21) }
+    const msg: Msg = { role: 'user', text: 'x'.repeat(18) }
 
     expect(estimatedMsgHeight(msg, 26, { compact: false, details: false, userPrompt: '❯' })).toBe(3)
     expect(estimatedMsgHeight(msg, 26, { compact: false, details: false, userPrompt: 'Ψ >' })).toBe(4)
