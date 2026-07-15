@@ -6647,9 +6647,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     crash_details: list[tuple[str, int, str, str]] = []
     # (task_id, pid, claimer, error_text)
     auto_blocked: list[str] = []
+    protocol_blocks: list[tuple[str, Optional[int], str]] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, "
+            "       block_kind, block_recurrences FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -6727,14 +6729,27 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             if protocol_violation:
+                same_cause = row["block_kind"] == _MISSING_HANDOFF_CLASSIFICATION
+                recurrences = (
+                    int(row["block_recurrences"] or 0) + 1 if same_cause else 1
+                )
+                target_status = (
+                    "triage" if recurrences >= BLOCK_RECURRENCE_LIMIT else "blocked"
+                )
                 cur = conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "last_failure_error = ?, block_kind = 'capability', "
-                    "block_recurrences = 1 "
+                    "last_failure_error = ?, block_kind = ?, "
+                    "block_recurrences = ? "
                     "WHERE id = ? AND status = 'running' "
                     "  AND worker_pid = ? AND claim_lock IS ?",
-                    (error_text[:500], row["id"], pid, row["claim_lock"]),
+                    (
+                        target_status,
+                        error_text[:500],
+                        _MISSING_HANDOFF_CLASSIFICATION,
+                        recurrences,
+                        row["id"], pid, row["claim_lock"],
+                    ),
                 )
             else:
                 cur = conn.execute(
@@ -6768,10 +6783,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # Keep the automatic block sticky until an operator
                     # explicitly unblocks it. Otherwise recompute_ready could
                     # turn the next dispatcher tick into an accidental retry.
+                    block_payload = {
+                        **event_payload,
+                        "kind": _MISSING_HANDOFF_CLASSIFICATION,
+                        "recurrences": recurrences,
+                    }
+                    block_event = "blocked"
+                    if target_status == "triage":
+                        block_event = "block_loop_detected"
+                        block_payload["limit"] = BLOCK_RECURRENCE_LIMIT
                     _append_event(
-                        conn, row["id"], "blocked", event_payload, run_id=run_id,
+                        conn, row["id"], block_event, block_payload, run_id=run_id,
                     )
                     auto_blocked.append(row["id"])
+                    protocol_blocks.append((row["id"], run_id, error_text))
                 elif rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
@@ -6788,6 +6813,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"], error_text)
                     )
+    # Match block_task's lifecycle contract without invoking hooks while the
+    # crash-reaper write transaction is held.
+    for tid, run_id, reason in protocol_blocks:
+        blocked_task = get_task(conn, tid)
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            tid,
+            board=get_current_board(),
+            assignee=blocked_task.assignee if blocked_task else None,
+            run_id=run_id,
+            reason=reason,
+        )
+
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
     # on top of the event we already emitted).

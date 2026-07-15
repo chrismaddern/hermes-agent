@@ -4459,7 +4459,8 @@ def test_clean_exit_without_handoff_blocks_with_bounded_log_evidence(kanban_home
         assert tid not in result_crashed, "a clean exit must not be a crash"
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
-        assert task.block_kind == "capability"
+        assert task.block_kind == "protocol_violation_missing_handoff"
+        assert task.block_recurrences == 1
         assert task.consecutive_failures == 0
         assert "ended cleanly (rc=0)" in (task.last_failure_error or "")
         assert "inspect stdout" in (task.last_failure_error or "")
@@ -4488,6 +4489,28 @@ def test_clean_exit_without_handoff_blocks_with_bounded_log_evidence(kanban_home
         assert tid in _kb.detect_crashed_workers._last_auto_blocked
         assert kb.recompute_ready(conn) == 0
         assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_repeated_missing_handoff_after_unblock_routes_to_triage(kanban_home):
+    """A manual unblock cannot create an unbounded clean-exit loop."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="quiet loop", assignee="worker")
+        _drive_protocol_violation(conn, tid, 999996)
+        assert kb.unblock_task(conn, tid) is True
+
+        _drive_protocol_violation(conn, tid, 999995)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.block_kind == "protocol_violation_missing_handoff"
+        assert task.block_recurrences == kb.BLOCK_RECURRENCE_LIMIT
+        events = kb.list_events(conn, tid)
+        loop_event = [e for e in events if e.kind == "block_loop_detected"][-1]
+        assert loop_event.payload["kind"] == "protocol_violation_missing_handoff"
+        assert loop_event.payload["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
     finally:
         conn.close()
 
