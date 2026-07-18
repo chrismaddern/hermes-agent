@@ -150,10 +150,13 @@ def test_real_keepalive_refreshes_claim_and_prevents_stale_reclaim(
         conn.commit()
 
     with worker_heartbeat_keepalive(interval_seconds=0.01):
+
         def refreshed() -> bool:
             with kb.connect() as conn:
                 task = kb.get_task(conn, task_id)
-                return bool(task and task.last_heartbeat_at and task.last_heartbeat_at > old)
+                return bool(
+                    task and task.last_heartbeat_at and task.last_heartbeat_at > old
+                )
 
         assert _wait_until(refreshed)
         with kb.connect() as conn:
