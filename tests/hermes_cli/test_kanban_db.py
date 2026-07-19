@@ -1695,7 +1695,7 @@ def test_archive_hides_from_default_list(kanban_home):
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
 
 
-def test_delete_archived_task_removes_related_rows(kanban_home):
+def test_legacy_delete_archived_task_is_non_mutating(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
@@ -1710,13 +1710,9 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         )
         conn.commit()
 
-        assert kb.delete_archived_task(conn, tid) is True
-        assert kb.get_task(conn, tid) is None
-        assert conn.execute("SELECT COUNT(*) FROM task_links WHERE child_id = ? OR parent_id = ?", (tid, tid)).fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+        assert kb.delete_archived_task(conn, tid) is False
+        assert kb.get_task(conn, tid) is not None
+        assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0] > 0
 
 
 def test_delete_archived_task_rejects_non_archived_rows(kanban_home):
@@ -1758,16 +1754,14 @@ def test_list_tasks_order_by(kanban_home):
         except ValueError as e:
             assert "order_by must be one of" in str(e)
 
-def test_delete_task_removes_task_and_cascades(kanban_home):
+def test_legacy_delete_task_is_non_mutating(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="to-delete", assignee="alice")
         kb.add_comment(conn, t, "user", "comment")
         kb.add_comment(conn, t, "user", "another")
-        assert kb.delete_task(conn, t)
-        assert kb.get_task(conn, t) is None
-        assert len(kb.list_comments(conn, t)) == 0
-        assert len(kb.list_events(conn, t)) == 0
-        assert len(kb.list_runs(conn, t)) == 0
+        assert not kb.delete_task(conn, t)
+        assert kb.get_task(conn, t) is not None
+        assert len(kb.list_comments(conn, t)) == 2
 
 
 def test_delete_task_returns_false_for_missing_task(kanban_home):
@@ -1775,16 +1769,16 @@ def test_delete_task_returns_false_for_missing_task(kanban_home):
         assert not kb.delete_task(conn, "t_nonexistent")
 
 
-def test_delete_task_cascades_links(kanban_home):
+def test_legacy_delete_task_preserves_links(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")
         c = kb.create_task(conn, title="child", parents=[p])
         child = kb.get_task(conn, c)
         assert child is not None and child.status == "todo"
-        kb.delete_task(conn, p)
-        assert kb.get_task(conn, p) is None
+        assert not kb.delete_task(conn, p)
+        assert kb.get_task(conn, p) is not None
         child_after = kb.get_task(conn, c)
-        assert child_after is not None and child_after.status == "ready"
+        assert child_after is not None and child_after.status == "todo"
 
 
 # ---------------------------------------------------------------------------
