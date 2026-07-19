@@ -4347,14 +4347,21 @@ def _terminate_cancel_worker_group(pid: int) -> Optional[str]:
     import signal
 
     pid = int(pid)
-    if not _pid_alive(pid):
-        return "already_stopped"
     if os.name == "nt":
+        if not _pid_alive(pid):
+            return "already_stopped"
         # Hermes's Windows process shim maps SIGTERM to TerminateProcess; the
         # PID identity proof above still prevents signalling a recycled PID.
         signal_target = lambda sig: os.kill(pid, sig)
         alive = lambda: _pid_alive(pid)
     else:
+        # The tracked leader can exit while descendants remain in its process
+        # group. PID liveness alone would incorrectly report that worker as
+        # already stopped and strand the descendants. The identity proof in
+        # cancel_running_task ran while the leader was live, so keep operating
+        # on that exact isolated group until the whole group is confirmed gone.
+        if not _process_group_alive(pid):
+            return "already_stopped"
         signal_target = lambda sig: os.killpg(pid, sig)  # windows-footgun: ok
         alive = lambda: _process_group_alive(pid)
 
@@ -4458,8 +4465,22 @@ def cancel_running_task(
                     "worker_foreign", "the active worker is owned by another host"
                 )
 
-            if not _pid_alive(worker_pid):
+            leader_alive = _pid_alive(worker_pid)
+            group_alive = (
+                leader_alive
+                if os.name == "nt"
+                else _process_group_alive(worker_pid)
+            )
+            if not group_alive:
                 worker_effect = "already_stopped"
+            elif not leader_alive:
+                # Descendants still exist, but the process that carried the
+                # task/run/claim identity is gone. Without that proof it is
+                # unsafe to signal a possibly reused process-group ID.
+                raise TaskCommandConflict(
+                    "worker_identity_mismatch",
+                    "the worker leader exited while its process group remains",
+                )
             else:
                 if not _cancel_worker_identity_matches(
                     worker_pid,

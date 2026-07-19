@@ -380,6 +380,7 @@ def _running_task(board, monkeypatch, *, pid=424242, claim_lock=None):
 def test_cancel_running_task_stops_exact_local_run_and_blocks(board, monkeypatch):
     task_id, task = _running_task(board, monkeypatch)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: True)
     monkeypatch.setattr(
         kb,
         "_cancel_worker_identity_matches",
@@ -418,6 +419,7 @@ def test_cancel_running_task_stops_exact_local_run_and_blocks(board, monkeypatch
 def test_cancel_running_task_finalizes_exact_already_stopped_worker(board, monkeypatch):
     task_id, task = _running_task(board, monkeypatch)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: False)
 
     result = kb.cancel_running_task(
         board,
@@ -430,9 +432,28 @@ def test_cancel_running_task_finalizes_exact_already_stopped_worker(board, monke
     assert kb.get_task(board, task_id).status == "blocked"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_cancel_fails_closed_when_dead_leader_has_live_descendants(board, monkeypatch):
+    task_id, task = _running_task(board, monkeypatch)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: True)
+
+    with pytest.raises(kb.TaskCommandConflict) as error:
+        kb.cancel_running_task(
+            board,
+            task_id,
+            expected_run_id=task.current_run_id,
+            expected_revision=task.revision,
+        )
+
+    assert error.value.code == "worker_identity_mismatch"
+    assert kb.get_task(board, task_id).status == "running"
+
+
 def test_cancel_running_task_fails_closed_for_foreign_or_identity_mismatch(board, monkeypatch):
     foreign_id, foreign = _running_task(board, monkeypatch, claim_lock="other-host:999")
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: True)
     with pytest.raises(kb.TaskCommandConflict) as foreign_error:
         kb.cancel_running_task(
             board,
@@ -461,6 +482,7 @@ def test_cancel_running_task_fails_closed_for_foreign_or_identity_mismatch(board
 def test_cancel_running_task_rolls_back_when_stop_is_unconfirmed(board, monkeypatch):
     task_id, task = _running_task(board, monkeypatch)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: True)
     monkeypatch.setattr(
         kb, "_cancel_worker_identity_matches", lambda pid, tid, **_identity: True
     )
@@ -487,6 +509,7 @@ def test_cancel_running_task_rolls_back_when_stop_is_unconfirmed(board, monkeypa
 def test_cancel_running_task_binds_revision_run_claim_and_pid(board, monkeypatch):
     task_id, task = _running_task(board, monkeypatch)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: False)
 
     with pytest.raises(kb.TaskRevisionConflict):
         kb.cancel_running_task(
@@ -509,6 +532,7 @@ def test_cancel_running_task_binds_revision_run_claim_and_pid(board, monkeypatch
 def test_cancel_running_task_can_join_caller_owned_transaction(board, monkeypatch):
     task_id, task = _running_task(board, monkeypatch)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: False)
 
     board.execute("BEGIN IMMEDIATE")
     kb.cancel_running_task(
@@ -525,6 +549,7 @@ def test_cancel_running_task_can_join_caller_owned_transaction(board, monkeypatc
 def test_cancel_standalone_transaction_does_not_retry_busy_window(board, monkeypatch):
     task_id, task = _running_task(board, monkeypatch)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: False)
     monkeypatch.setattr(
         kb,
         "_execute_boundary_with_retry",
@@ -547,6 +572,7 @@ def test_cancel_standalone_transaction_does_not_retry_busy_window(board, monkeyp
 def test_cancel_cli_uses_canonical_cancel_not_reclaim(board, monkeypatch, capsys):
     task_id, task = _running_task(board, monkeypatch)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: False)
 
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
@@ -632,6 +658,7 @@ def test_cancel_uses_bounded_sigkill_after_term_grace(monkeypatch):
     sent = []
 
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: True)
     monkeypatch.setattr(kb.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(kb.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     monkeypatch.setattr(kb.os, "killpg", lambda pgid, sig: sent.append(sig))
@@ -642,6 +669,19 @@ def test_cancel_uses_bounded_sigkill_after_term_grace(monkeypatch):
     assert effect == "stopped"
     assert sent == [signal.SIGTERM, signal.SIGKILL]
     assert clock[0] <= 5.0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group semantics")
+def test_cancel_terminator_tracks_group_after_leader_exits(monkeypatch):
+    sent = []
+    probes = iter([True, True, False])
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: next(probes))
+    monkeypatch.setattr(kb.os, "killpg", lambda pgid, sig: sent.append(sig))
+
+    assert kb._terminate_cancel_worker_group(424242) == "stopped"
+    assert sent == [signal.SIGTERM]
 
 
 def test_natural_completion_racing_cancel_has_one_terminal_winner(
