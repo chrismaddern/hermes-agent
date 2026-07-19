@@ -826,6 +826,23 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
+        # A running task is owned by its exact worker run. Dashboard edits,
+        # reassignment, and drag/drop transitions must not invalidate the
+        # worker's prompt or silently reclaim it. Recovery is explicit via
+        # the canonical reclaim/cancel commands.
+        running_edit = {"assignee", "priority", "title", "body"} & payload.model_fields_set
+        running_transition = (
+            "status" in payload.model_fields_set and payload.status != "done"
+        )
+        if task.status == "running" and (running_edit or running_transition):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Task is running and owned by its current worker; "
+                    "use explicit reclaim or cancel recovery"
+                ),
+            )
+
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
             try:
@@ -853,12 +870,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
-                # Re-open a blocked/scheduled task, or just an explicit status set.
+                # Re-open or promote through canonical dependency-aware helpers.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
                     ok = kanban_db.unblock_task(conn, task_id)
+                elif current and current.status == "todo":
+                    ok, _ = kanban_db.promote_task(
+                        conn, task_id, actor="dashboard", force=False,
+                    )
+                elif current and current.status == "ready":
+                    ok = True
                 else:
-                    # Direct status write for drag-drop (todo -> ready etc).
+                    # Preserve compatibility for non-running legacy drag/drop
+                    # sources that do not have a canonical transition helper.
                     ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
@@ -894,41 +918,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     detail=f"status transition to {s!r} not valid from current state",
                 )
 
-        # --- priority -----------------------------------------------------
-        if payload.priority is not None:
-            with kanban_db.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET priority = ? WHERE id = ?",
-                    (int(payload.priority), task_id),
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'reprioritized', ?, ?)",
-                    (task_id, json.dumps({"priority": int(payload.priority)}),
-                     int(time.time())),
-                )
-
-        # --- title / body -------------------------------------------------
-        if payload.title is not None or payload.body is not None:
-            with kanban_db.write_txn(conn):
-                sets, vals = [], []
-                if payload.title is not None:
-                    if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
-                    sets.append("title = ?")
-                    vals.append(payload.title.strip())
-                if payload.body is not None:
-                    sets.append("body = ?")
-                    vals.append(payload.body)
-                vals.append(task_id)
-                conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
+        # --- canonical atomic field edit ---------------------------------
+        edit_kwargs = {
+            field: getattr(payload, field)
+            for field in ("title", "body", "priority")
+            if field in payload.model_fields_set and getattr(payload, field) is not None
+        }
+        if edit_kwargs:
+            try:
+                kanban_db.edit_task_fields(conn, task_id, **edit_kwargs)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            except kanban_db.TaskCommandConflict as exc:
+                raise HTTPException(status_code=409, detail=exc.detail)
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
@@ -1203,6 +1205,22 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     entry.update(ok=False, error="not found")
                     results.append(entry)
                     continue
+                running_mutation = (
+                    payload.archive
+                    or payload.assignee is not None
+                    or payload.priority is not None
+                    or (payload.status is not None and payload.status != "done")
+                )
+                if task.status == "running" and running_mutation:
+                    entry.update(
+                        ok=False,
+                        error=(
+                            "Task is running and owned by its current worker; "
+                            "use explicit reclaim or cancel recovery"
+                        ),
+                    )
+                    results.append(entry)
+                    continue
                 if payload.archive:
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")
@@ -1259,17 +1277,9 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     except RuntimeError as e:
                         entry.update(ok=False, error=str(e))
                 if payload.priority is not None:
-                    with kanban_db.write_txn(conn):
-                        conn.execute(
-                            "UPDATE tasks SET priority = ? WHERE id = ?",
-                            (int(payload.priority), tid),
-                        )
-                        conn.execute(
-                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                            "VALUES (?, 'reprioritized', ?, ?)",
-                            (tid, json.dumps({"priority": int(payload.priority)}),
-                             int(time.time())),
-                        )
+                    kanban_db.edit_task_fields(
+                        conn, tid, priority=int(payload.priority)
+                    )
             except Exception as e:  # defensive — one bad id shouldn't kill the batch
                 entry.update(ok=False, error=str(e))
             results.append(entry)
