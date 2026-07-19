@@ -82,6 +82,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "revision": t.revision,
     }
 
 
@@ -456,6 +457,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reclaim.add_argument(
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
+    )
+
+    p_cancel = sub.add_parser(
+        "cancel",
+        help="Stop one exact local worker run and leave its task blocked",
+    )
+    p_cancel.add_argument("task_id")
+    p_cancel.add_argument(
+        "--run-id", type=int, required=True,
+        help="Exact current run id to stop (required; never inferred)",
+    )
+    p_cancel.add_argument(
+        "--revision", type=int, default=None,
+        help="Optional expected task revision for optimistic concurrency",
     )
 
     p_reassign = sub.add_parser(
@@ -1007,6 +1022,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
+            "cancel":   _cmd_cancel,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
@@ -1706,6 +1722,22 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"Reclaimed {args.task_id}")
+    return 0
+
+
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        result = kb.cancel_running_task(
+            conn,
+            args.task_id,
+            expected_run_id=args.run_id,
+            expected_revision=getattr(args, "revision", None),
+        )
+    effect = result.worker_effect.replace("_", " ")
+    print(
+        f"Cancelled run {result.run_id} for {args.task_id}: "
+        f"worker {effect}; task blocked (revision {result.revision})"
+    )
     return 0
 
 

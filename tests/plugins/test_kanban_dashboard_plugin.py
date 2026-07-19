@@ -619,6 +619,63 @@ def test_patch_priority_and_edit(client):
     assert data["priority"] == 5
     assert data["title"] == "renamed"
 
+    detail = client.get(
+        f"/api/plugins/kanban/tasks/{t['id']}"
+    ).json()
+    edited = [event for event in detail["events"] if event["kind"] == "edited"]
+    assert edited[-1]["payload"] == {"fields": ["title", "priority"]}
+    assert "renamed" not in str(edited[-1]["payload"])
+
+
+def test_patch_fields_are_atomic_and_running_task_is_not_editable(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+
+    # One invalid field must prevent every supplied field from landing.
+    invalid = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"title": "must not land", "priority": 1001},
+    )
+    assert invalid.status_code == 400
+    unchanged = client.get(
+        f"/api/plugins/kanban/tasks/{t['id']}"
+    ).json()["task"]
+    assert unchanged["title"] == "x"
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, t["id"], claimer=f"{kb._claimer_id().split(':', 1)[0]}:999")
+        assert claimed is not None
+
+    locked = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"title": "also must not land", "priority": 9},
+    )
+    assert locked.status_code == 409
+    assert "running" in locked.json()["detail"].lower()
+    unchanged = client.get(
+        f"/api/plugins/kanban/tasks/{t['id']}"
+    ).json()["task"]
+    assert unchanged["title"] == "x"
+
+
+def test_dashboard_cannot_drag_running_task_to_ready(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, t["id"], claimer=f"{kb._claimer_id().split(':', 1)[0]}:999")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "ready"},
+    )
+
+    assert response.status_code == 409
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t["id"])
+        run = conn.execute("SELECT status, outcome FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    assert task.status == "running"
+    assert task.current_run_id == run_id
+    assert tuple(run) == ("running", None)
+
 
 def test_patch_invalid_status(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
@@ -1195,6 +1252,44 @@ def test_bulk_status_running_rejected(client):
     assert statuses.get(t["id"]) != "running"
 
 
+def test_bulk_mutations_cannot_reclaim_or_reprioritize_running_task(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "owned"}).json()["task"]
+    conn = kb.connect()
+    try:
+        claimed = kb.claim_task(
+            conn,
+            t["id"],
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:bulk",
+        )
+        assert claimed is not None
+        before = kb.get_task(conn, t["id"])
+    finally:
+        conn.close()
+
+    move = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [t["id"]], "status": "ready"},
+    ).json()["results"][0]
+    priority = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [t["id"]], "priority": 99},
+    ).json()["results"][0]
+
+    assert move["ok"] is False
+    assert priority["ok"] is False
+    conn = kb.connect()
+    try:
+        after = kb.get_task(conn, t["id"])
+        run = kb.latest_run(conn, t["id"])
+        assert after.status == "running"
+        assert after.priority == before.priority
+        assert after.current_run_id == before.current_run_id
+        assert run.status == "running"
+        assert run.outcome is None
+    finally:
+        conn.close()
+
+
 def test_dashboard_done_actions_prompt_for_completion_summary():
     repo_root = Path(__file__).resolve().parents[2]
     bundle = (
@@ -1462,8 +1557,8 @@ def test_patch_status_done_without_summary_still_works(client):
         conn.close()
 
 
-def test_patch_status_archive_closes_running_run(client):
-    """PATCH to archived while running must close the in-flight run."""
+def test_patch_status_archive_refuses_running_run(client):
+    """Archive is not worker recovery; an active run remains untouched."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "z", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
@@ -1478,13 +1573,16 @@ def test_patch_status_archive_closes_running_run(client):
         f"/api/plugins/kanban/tasks/{tid}",
         json={"status": "archived"},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 409, r.text
     conn = kb.connect()
     try:
         task = kb.get_task(conn, tid)
-        assert task.status == "archived"
-        assert task.current_run_id is None
-        assert kb.latest_run(conn, tid).outcome == "reclaimed"
+        assert task.status == "running"
+        assert task.current_run_id == open_run.id
+        latest = kb.latest_run(conn, tid)
+        assert latest.status == "running"
+        assert latest.outcome is None
+        assert latest.ended_at is None
     finally:
         conn.close()
 

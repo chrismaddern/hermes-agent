@@ -914,6 +914,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Monotonic optimistic-concurrency token. A schema trigger advances this
+    # for every task-row update, including writers outside this module.
+    revision: int = 1
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -997,6 +1000,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            revision=(
+                int(row["revision"])
+                if "revision" in keys and row["revision"] is not None
+                else 1
             ),
         )
 
@@ -1175,7 +1183,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    revision             INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2207,12 +2216,59 @@ def init_db(
     return path
 
 
+def _migrate_task_revision(
+    conn: sqlite3.Connection,
+    *,
+    columns: Optional[set[str]] = None,
+) -> None:
+    """Install the revision column and trigger as one atomic migration."""
+    known_columns = columns
+    if known_columns is None:
+        known_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+    owns_transaction = not conn.in_transaction
+    savepoint = "task_revision_migration"
+    try:
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        else:
+            conn.execute(f"SAVEPOINT {savepoint}")
+        if "revision" not in known_columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+            )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS tasks_revision_after_update
+            AFTER UPDATE ON tasks
+            FOR EACH ROW WHEN NEW.revision = OLD.revision
+            BEGIN
+              UPDATE tasks SET revision = OLD.revision + 1 WHERE id = OLD.id;
+            END
+            """
+        )
+        if owns_transaction:
+            conn.execute("COMMIT")
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        if owns_transaction:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+        else:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    _migrate_task_revision(conn, columns=cols)
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
@@ -3065,6 +3121,219 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def task_revision(row: Any) -> int:
+    """Return the canonical integer revision from a Task or SQLite row."""
+    if isinstance(row, Task):
+        return int(row.revision)
+    if row is None:
+        raise ValueError("task row is required")
+    try:
+        return int(row["revision"])
+    except (KeyError, IndexError, TypeError):
+        value = getattr(row, "revision", None)
+        if value is None:
+            raise ValueError("task row has no revision")
+        return int(value)
+
+
+def touch_task_revision(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Advance revision for detail stored outside the tasks row exactly once."""
+    cur = conn.execute(
+        "UPDATE tasks SET revision = revision + 1 WHERE id = ?", (task_id,)
+    )
+    return cur.rowcount == 1
+
+
+class TaskCommandConflict(RuntimeError):
+    """Structured refusal from a canonical state-sensitive task command."""
+
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        self.detail = detail
+        super().__init__(detail)
+
+
+class TaskRevisionConflict(TaskCommandConflict):
+    """The caller's optimistic-concurrency revision is stale."""
+
+    def __init__(self, expected_revision: int, actual_revision: int):
+        self.expected_revision = int(expected_revision)
+        self.actual_revision = int(actual_revision)
+        super().__init__(
+            "revision_conflict",
+            f"expected task revision {expected_revision}, found {actual_revision}",
+        )
+
+
+@dataclass(frozen=True)
+class TaskEditResult:
+    applied: bool
+    revision: int
+    changed_fields: tuple[str, ...]
+
+
+_UNSET = object()
+_EDITABLE_SPEC_STATUSES = frozenset({"triage", "todo", "scheduled", "ready", "blocked"})
+_EDITABLE_PRIORITY_STATUSES = _EDITABLE_SPEC_STATUSES | {"review"}
+
+
+def _command_transaction(conn: sqlite3.Connection, transaction_owned: bool):
+    if transaction_owned:
+        if not conn.in_transaction:
+            raise RuntimeError("transaction_owned=True requires an active transaction")
+        return contextlib.nullcontext(conn)
+    if conn.in_transaction:
+        raise RuntimeError(
+            "connection already has a transaction; pass transaction_owned=True"
+        )
+    return write_txn(conn)
+
+
+@contextlib.contextmanager
+def _bounded_cancel_transaction(
+    conn: sqlite3.Connection, transaction_owned: bool
+):
+    """Use one SQLite busy-timeout window for a standalone cancellation."""
+    if transaction_owned:
+        with _command_transaction(conn, True):
+            yield conn
+        return
+    if conn.in_transaction:
+        raise RuntimeError(
+            "connection already has a transaction; pass transaction_owned=True"
+        )
+
+    # Unlike general Kanban writes, cancellation must not multiply its
+    # configured 10-second busy timeout through boundary retries.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+    else:
+        try:
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        _check_file_length_invariant(conn)
+
+
+def edit_task_fields(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    title: Any = _UNSET,
+    body: Any = _UNSET,
+    priority: Any = _UNSET,
+    project_id: Any = _UNSET,
+    expected_revision: Optional[int] = None,
+    transaction_owned: bool = False,
+) -> TaskEditResult:
+    """Atomically edit safe task fields with optional revision CAS.
+
+    Omitted values are distinct from explicit ``None`` for nullable body and
+    project_id. The ``edited`` event contains field names only; content never
+    enters the event payload. A no-op is a successful result without an event
+    or revision advance.
+    """
+    supplied = {
+        "title": title,
+        "body": body,
+        "priority": priority,
+        "project_id": project_id,
+    }
+    if all(value is _UNSET for value in supplied.values()):
+        raise ValueError("at least one editable field is required")
+
+    normalized: dict[str, Any] = {}
+    if title is not _UNSET:
+        if title is None or not isinstance(title, str) or not title.strip():
+            raise ValueError("title must be a non-blank string")
+        normalized["title"] = title.strip()
+        if len(normalized["title"]) > 500:
+            raise ValueError("title must be at most 500 characters")
+    if body is not _UNSET:
+        if body is not None and not isinstance(body, str):
+            raise ValueError("body must be a string or None")
+        if isinstance(body, str) and len(body) > 12000:
+            raise ValueError("body must be at most 12000 characters")
+        normalized["body"] = body
+    if priority is not _UNSET:
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ValueError("priority must be an integer")
+        if not -1000 <= priority <= 1000:
+            raise ValueError("priority must be between -1000 and 1000")
+        normalized["priority"] = priority
+    if project_id is not _UNSET:
+        if project_id is not None:
+            if not isinstance(project_id, str) or not project_id.strip():
+                raise ValueError("project_id must be a non-blank string or None")
+            project_id = project_id.strip()
+            if len(project_id) > 200:
+                raise ValueError("project_id must be at most 200 characters")
+        normalized["project_id"] = project_id
+
+    with _command_transaction(conn, transaction_owned):
+        row = conn.execute(
+            "SELECT title, body, priority, project_id, status, revision "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise TaskCommandConflict("task_not_found", f"task {task_id} not found")
+        actual_revision = int(row["revision"])
+        if expected_revision is not None and actual_revision != int(expected_revision):
+            raise TaskRevisionConflict(int(expected_revision), actual_revision)
+
+        spec_fields = {"title", "body", "project_id"} & normalized.keys()
+        if spec_fields and row["status"] not in _EDITABLE_SPEC_STATUSES:
+            raise TaskCommandConflict(
+                "action_not_allowed",
+                f"task specification cannot be edited while status is {row['status']}",
+            )
+        if "priority" in normalized and row["status"] not in _EDITABLE_PRIORITY_STATUSES:
+            raise TaskCommandConflict(
+                "action_not_allowed",
+                f"task priority cannot be edited while status is {row['status']}",
+            )
+
+        changed = tuple(
+            field for field in ("title", "body", "priority", "project_id")
+            if field in normalized and normalized[field] != row[field]
+        )
+        if not changed:
+            return TaskEditResult(True, actual_revision, ())
+
+        assignments = ", ".join(f"{field} = ?" for field in changed)
+        params = [normalized[field] for field in changed]
+        sql = f"UPDATE tasks SET {assignments} WHERE id = ?"
+        params.append(task_id)
+        if expected_revision is not None:
+            sql += " AND revision = ?"
+            params.append(int(expected_revision))
+        cur = conn.execute(sql, tuple(params))
+        if cur.rowcount != 1:
+            latest = conn.execute(
+                "SELECT revision FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if latest is None:
+                raise TaskCommandConflict("task_not_found", f"task {task_id} not found")
+            raise TaskRevisionConflict(int(expected_revision), int(latest["revision"]))
+        _append_event(conn, task_id, "edited", {"fields": list(changed)})
+        revision = int(conn.execute(
+            "SELECT revision FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["revision"])
+        return TaskEditResult(True, revision, changed)
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -3131,7 +3400,13 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    expected_revision: Optional[int] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -3140,10 +3415,12 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, revision FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
+        if expected_revision is not None and int(row["revision"]) != int(expected_revision):
+            raise TaskRevisionConflict(int(expected_revision), int(row["revision"]))
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -3155,11 +3432,18 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
-                (profile, task_id),
+                "last_failure_error = NULL WHERE id = ?" +
+                ("" if expected_revision is None else " AND revision = ?"),
+                (profile, task_id) if expected_revision is None
+                else (profile, task_id, int(expected_revision)),
             )
         else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+            conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ?" +
+                ("" if expected_revision is None else " AND revision = ?"),
+                (profile, task_id) if expected_revision is None
+                else (profile, task_id, int(expected_revision)),
+            )
         _append_event(conn, task_id, "assigned", {"assignee": profile})
         return True
 
@@ -3179,7 +3463,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
-        conn.execute(
+        link_cur = conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
@@ -3187,11 +3471,16 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
+        status_cur = None
         if parent_status != "done":
-            conn.execute(
+            status_cur = conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
+        if link_cur.rowcount and (status_cur is None or status_cur.rowcount == 0):
+            # A dependency changes task detail even when the child's queue
+            # status was already correct and therefore no task-row writer ran.
+            touch_task_revision(conn, child_id)
         _append_event(
             conn, child_id, "linked",
             {"parent": parent_id, "child": child_id},
@@ -3228,6 +3517,7 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
             (parent_id, child_id),
         )
         if cur.rowcount:
+            touch_task_revision(conn, child_id)
             _append_event(
                 conn, child_id, "unlinked",
                 {"parent": parent_id, "child": child_id},
@@ -3296,6 +3586,9 @@ def add_comment(
             (task_id, author.strip(), body.strip(), now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        # Comments and their event live outside tasks but are part of task
+        # detail, so invalidate optimistic readers exactly once.
+        touch_task_revision(conn, task_id)
         return int(cur.lastrowid or 0)
 
 
@@ -3477,6 +3770,7 @@ def add_attachment(
             "attached",
             {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
         )
+        touch_task_revision(conn, task_id)
         return int(cur.lastrowid or 0)
 
 
@@ -3533,6 +3827,7 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
         _append_event(
             conn, att.task_id, "attachment_removed", {"filename": att.filename}
         )
+        touch_task_revision(conn, att.task_id)
     try:
         p = Path(att.stored_path)
         if p.is_file():
@@ -4294,6 +4589,326 @@ def reclaim_task(
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
     return True
+
+
+@dataclass(frozen=True)
+class CancelTaskResult:
+    applied: bool
+    revision: int
+    run_id: int
+    worker_effect: str
+
+
+def _claim_host_is_local(claim_lock: Optional[str]) -> bool:
+    if not claim_lock:
+        return False
+    local_host = _claimer_id().split(":", 1)[0]
+    claim_host = str(claim_lock).split(":", 1)[0]
+    return bool(local_host) and claim_host == local_host
+
+
+def _cancel_worker_identity_matches(
+    pid: int,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    expected_claim_lock: str,
+) -> bool:
+    """Fail-closed proof that PID is this task's isolated Hermes worker."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        import psutil
+
+        process = psutil.Process(int(pid))
+        environment = process.environ()
+        if environment.get("HERMES_KANBAN_TASK") != task_id:
+            return False
+        if environment.get("HERMES_KANBAN_RUN_ID") != str(expected_run_id):
+            return False
+        if environment.get("HERMES_KANBAN_CLAIM_LOCK") != expected_claim_lock:
+            return False
+        command = " ".join(process.cmdline())
+        if task_id not in command or "work kanban task" not in command:
+            return False
+        if os.name != "nt" and os.getpgid(int(pid)) != int(pid):
+            # Dispatcher workers are started in a fresh session. Refuse to
+            # signal a shared or inherited process group.
+            return False
+        return True
+    except (OSError, ValueError, psutil.Error):
+        return False
+
+
+def _process_group_alive(pgid: int) -> bool:
+    if os.name == "nt":
+        return _pid_alive(pgid)
+    if sys.platform == "linux":
+        # killpg(..., 0) reports zombie leaders as present until their parent
+        # reaps them. Scan the group and count only non-zombie members so a
+        # confirmed exit does not consume the full kill window or fail closed
+        # merely because waitpid has not run yet.
+        proc_root = Path("/proc")
+        try:
+            entries = proc_root.iterdir()
+        except OSError:
+            # Losing /proc visibility is not proof that the group exited.
+            # Fall back to the kernel existence probe and fail closed on any
+            # result other than an explicit ProcessLookupError.
+            try:
+                os.killpg(int(pgid), 0)  # windows-footgun: ok - POSIX branch
+                return True
+            except ProcessLookupError:
+                return False
+            except OSError:
+                return True
+        evidence_unreadable = False
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / "stat").read_text(encoding="utf-8")
+                rest = raw[raw.rfind(")") + 2:].split()
+                state = rest[0]
+                process_group = int(rest[2])
+            except (OSError, ValueError, IndexError):
+                evidence_unreadable = True
+                continue
+            if process_group == int(pgid) and state != "Z":
+                return True
+        if not evidence_unreadable:
+            return False
+        # A partial /proc scan cannot prove absence. Only an ESRCH kernel
+        # probe is strong enough to report the process group gone.
+        try:
+            os.killpg(int(pgid), 0)  # windows-footgun: ok - POSIX branch
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+    try:
+        os.killpg(int(pgid), 0)  # windows-footgun: ok - POSIX branch
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # We cannot prove it is gone.
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_cancel_worker_group(pid: int) -> Optional[str]:
+    """Stop and confirm an isolated worker group within a five-second cap."""
+    import signal
+
+    pid = int(pid)
+    if os.name == "nt":
+        if not _pid_alive(pid):
+            return "already_stopped"
+        # Hermes's Windows process shim maps SIGTERM to TerminateProcess; the
+        # PID identity proof above still prevents signalling a recycled PID.
+        signal_target = lambda sig: os.kill(pid, sig)
+        alive = lambda: _pid_alive(pid)
+    else:
+        # The tracked leader can exit while descendants remain in its process
+        # group. PID liveness alone would incorrectly report that worker as
+        # already stopped and strand the descendants. The identity proof in
+        # cancel_running_task ran while the leader was live, so keep operating
+        # on that exact isolated group until the whole group is confirmed gone.
+        if not _process_group_alive(pid):
+            return "already_stopped"
+        signal_target = lambda sig: os.killpg(pid, sig)  # windows-footgun: ok
+        alive = lambda: _process_group_alive(pid)
+
+    stop_started = time.monotonic()
+    hard_deadline = stop_started + 5.0
+    try:
+        signal_target(signal.SIGTERM)
+    except ProcessLookupError:
+        return "already_stopped"
+    except OSError:
+        return None
+
+    deadline = min(stop_started + 3.0, hard_deadline)
+    while time.monotonic() < deadline:
+        if not alive():
+            return "stopped"
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.05, remaining))
+
+    try:
+        signal_target(getattr(signal, "SIGKILL", signal.SIGTERM))
+    except ProcessLookupError:
+        return "stopped"
+    except OSError:
+        return None
+
+    deadline = hard_deadline
+    while time.monotonic() < deadline:
+        if not alive():
+            return "stopped"
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.05, remaining))
+    return None
+
+
+def cancel_running_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    expected_revision: Optional[int] = None,
+    transaction_owned: bool = False,
+) -> CancelTaskResult:
+    """Stop the exact local worker run and atomically leave its task blocked.
+
+    The write transaction remains held throughout identity proof, bounded
+    process-group termination, run closure, task transition, and event append.
+    ``transaction_owned=True`` lets an API caller add its receipt before it
+    commits the same transaction.
+    """
+    if not isinstance(expected_run_id, int) or isinstance(expected_run_id, bool):
+        raise ValueError("expected_run_id must be a positive integer")
+    if expected_run_id <= 0:
+        raise ValueError("expected_run_id must be a positive integer")
+
+    old_busy_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+    if not transaction_owned:
+        conn.execute("PRAGMA busy_timeout=10000")
+    try:
+        with _bounded_cancel_transaction(conn, transaction_owned):
+            row = conn.execute(
+                """
+                SELECT t.status, t.revision, t.current_run_id,
+                       t.claim_lock, t.worker_pid, t.block_recurrences,
+                       r.status AS run_status, r.ended_at AS run_ended_at,
+                       r.claim_lock AS run_claim_lock,
+                       r.worker_pid AS run_worker_pid
+                  FROM tasks t
+                  LEFT JOIN task_runs r ON r.id = t.current_run_id
+                 WHERE t.id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskCommandConflict("task_not_found", f"task {task_id} not found")
+            actual_revision = int(row["revision"])
+            if (
+                expected_revision is not None
+                and actual_revision != int(expected_revision)
+            ):
+                raise TaskRevisionConflict(int(expected_revision), actual_revision)
+            if (
+                row["status"] != "running"
+                or row["current_run_id"] != expected_run_id
+                or row["run_status"] != "running"
+                or row["run_ended_at"] is not None
+                or row["claim_lock"] is None
+                or row["claim_lock"] != row["run_claim_lock"]
+                or row["worker_pid"] is None
+                or row["worker_pid"] != row["run_worker_pid"]
+            ):
+                raise TaskCommandConflict(
+                    "run_changed", "the active task run or claim identity changed"
+                )
+            claim_lock = str(row["claim_lock"])
+            worker_pid = int(row["worker_pid"])
+            if not _claim_host_is_local(claim_lock):
+                raise TaskCommandConflict(
+                    "worker_foreign", "the active worker is owned by another host"
+                )
+
+            leader_alive = _pid_alive(worker_pid)
+            group_alive = (
+                leader_alive
+                if os.name == "nt"
+                else _process_group_alive(worker_pid)
+            )
+            if not group_alive:
+                worker_effect = "already_stopped"
+            elif not leader_alive:
+                # Descendants still exist, but the process that carried the
+                # task/run/claim identity is gone. Without that proof it is
+                # unsafe to signal a possibly reused process-group ID.
+                raise TaskCommandConflict(
+                    "worker_identity_mismatch",
+                    "the worker leader exited while its process group remains",
+                )
+            else:
+                if not _cancel_worker_identity_matches(
+                    worker_pid,
+                    task_id,
+                    expected_run_id=expected_run_id,
+                    expected_claim_lock=claim_lock,
+                ):
+                    raise TaskCommandConflict(
+                        "worker_identity_mismatch",
+                        "the worker PID identity could not be proven",
+                    )
+                worker_effect = _terminate_cancel_worker_group(worker_pid)
+                if worker_effect not in {"stopped", "already_stopped"}:
+                    raise TaskCommandConflict(
+                        "worker_stop_unconfirmed",
+                        "the worker process group could not be confirmed stopped",
+                    )
+
+            now = int(time.time())
+            run_update = conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'cancelled', outcome = 'cancelled',
+                       summary = 'Cancelled by operator.', ended_at = ?,
+                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND task_id = ? AND status = 'running'
+                   AND ended_at IS NULL AND claim_lock = ? AND worker_pid = ?
+                """,
+                (now, expected_run_id, task_id, claim_lock, worker_pid),
+            )
+            if run_update.rowcount != 1:
+                raise TaskCommandConflict(
+                    "run_changed", "the active run changed before cancellation"
+                )
+            task_update = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'blocked', block_kind = 'needs_input',
+                       current_run_id = NULL, claim_lock = NULL,
+                       claim_expires = NULL, worker_pid = NULL
+                 WHERE id = ? AND status = 'running' AND revision = ?
+                   AND current_run_id = ? AND claim_lock = ? AND worker_pid = ?
+                """,
+                (
+                    task_id, actual_revision, expected_run_id,
+                    claim_lock, worker_pid,
+                ),
+            )
+            if task_update.rowcount != 1:
+                raise TaskCommandConflict(
+                    "run_changed", "the task claim changed before cancellation"
+                )
+            _append_event(
+                conn,
+                task_id,
+                "cancelled_by_operator",
+                {"worker_effect": worker_effect},
+                run_id=expected_run_id,
+            )
+            revision = int(conn.execute(
+                "SELECT revision FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()["revision"])
+            return CancelTaskResult(
+                applied=True,
+                revision=revision,
+                run_id=expected_run_id,
+                worker_effect=worker_effect,
+            )
+    finally:
+        if not transaction_owned:
+            conn.execute(f"PRAGMA busy_timeout={old_busy_timeout}")
 
 
 def reassign_task(
@@ -5252,6 +5867,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_revision: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5288,11 +5904,19 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, revision "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        if (
+            expected_revision is not None
+            and int(cur_row["revision"]) != int(expected_revision)
+        ):
+            raise TaskRevisionConflict(
+                int(expected_revision), int(cur_row["revision"])
+            )
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -5469,6 +6093,7 @@ def promote_task(
     reason: Optional[str] = None,
     force: bool = False,
     dry_run: bool = False,
+    expected_revision: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Manually promote a `todo` or `blocked` task to `ready`.
 
@@ -5480,44 +6105,53 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
-    row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if row is None:
-        return False, f"task {task_id} not found"
-
-    cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
-        )
-
-    if not force:
-        parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
-            (task_id,),
-        ).fetchall()
-        unsatisfied = [
-            p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
-        ]
-        if unsatisfied:
-            return False, (
-                f"unsatisfied parent dependencies: "
-                f"{', '.join(unsatisfied)} (use --force to override)"
+    def _evaluate(*, apply: bool) -> tuple[bool, Optional[str]]:
+        row = conn.execute(
+            "SELECT status, revision FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        if (
+            expected_revision is not None
+            and int(row["revision"]) != int(expected_revision)
+        ):
+            raise TaskRevisionConflict(
+                int(expected_revision), int(row["revision"])
             )
 
-    if dry_run:
-        return True, None
+        cur_status = row["status"]
+        if cur_status not in ("todo", "blocked"):
+            return False, (
+                f"task {task_id} is {cur_status!r}; promote only applies to "
+                f"'todo' or 'blocked'"
+            )
 
-    with write_txn(conn):
+        if not force:
+            parents = conn.execute(
+                "SELECT t.id, t.status FROM tasks t "
+                "JOIN task_links l ON l.parent_id = t.id "
+                "WHERE l.child_id = ?",
+                (task_id,),
+            ).fetchall()
+            unsatisfied = [
+                parent["id"] for parent in parents
+                if parent["status"] not in ("done", "archived")
+            ]
+            if unsatisfied:
+                return False, (
+                    "unsatisfied parent dependencies: "
+                    f"{', '.join(unsatisfied)} (use --force to override)"
+                )
+
+        if not apply:
+            return True, None
+
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
-            (task_id,),
+            "WHERE id = ? AND status IN ('todo', 'blocked')" +
+            ("" if expected_revision is None else " AND revision = ?"),
+            (task_id,) if expected_revision is None
+            else (task_id, int(expected_revision)),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
@@ -5527,11 +6161,22 @@ def promote_task(
             "promoted_manual",
             {"actor": actor, "reason": reason, "forced": force},
         )
+        return True, None
 
-    return True, None
+    if dry_run:
+        return _evaluate(apply=False)
+    # Eligibility (including dependencies and revision) and mutation share one
+    # write transaction so a newly-linked parent cannot race the promotion.
+    with write_txn(conn):
+        return _evaluate(apply=True)
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_revision: Optional[int] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -5544,9 +6189,19 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id, revision, status FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        if (
+            stale
+            and expected_revision is not None
+            and int(stale["revision"]) != int(expected_revision)
+        ):
+            raise TaskRevisionConflict(
+                int(expected_revision), int(stale["revision"])
+            )
+        if stale is None or stale["status"] not in ("blocked", "scheduled"):
+            return False
         if stale and stale["current_run_id"]:
             conn.execute(
                 """
@@ -5911,13 +6566,30 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_revision: Optional[int] = None,
+) -> bool:
     with write_txn(conn):
+        row = conn.execute(
+            "SELECT revision, status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if expected_revision is not None and int(row["revision"]) != int(expected_revision):
+            raise TaskRevisionConflict(int(expected_revision), int(row["revision"]))
+        if row["status"] == "archived":
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
-            (task_id,),
+            "WHERE id = ? AND status != 'archived'" +
+            ("" if expected_revision is None else " AND revision = ?"),
+            (task_id,) if expected_revision is None
+            else (task_id, int(expected_revision)),
         )
         if cur.rowcount != 1:
             return False
