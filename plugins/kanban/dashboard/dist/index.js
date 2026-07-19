@@ -119,10 +119,10 @@
     suspected_hallucinated_references: "⚠ Prose referenced phantom card ids",
   };
   const FALLBACK_TRASH = {
-    label: "Trash",
-    title: "Drag a card here to permanently delete it",
-    confirm: "Permanently delete this task? This cannot be undone.",
-    dropHint: "Drop to delete",
+    label: "Archive",
+    title: "Drag a card here to archive it",
+    confirm: "Archive this task?",
+    dropHint: "Drop to archive",
   };
   const DIAGNOSTIC_EVENT_KIND_KEYS = {
     completion_blocked_hallucination: "completionBlockedHallucination",
@@ -998,8 +998,8 @@
 
    const deleteTask = useCallback(function (taskId) {
      if (!window.confirm(tx(t, "trash.confirm", FALLBACK_TRASH.confirm))) return Promise.resolve();
-     return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}`, {
-       method: "DELETE",
+     return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(taskId)}/archive`, {
+       method: "POST",
      }).then(function () {
        loadBoard();
        setSelectedIds(function (prev) {
@@ -1012,11 +1012,11 @@
 
     const deleteSelected = useCallback(function (count) {
       if (selectedIds.size === 0) return Promise.resolve();
-      if (!window.confirm(tx(t, "trash.confirmMany", "Permanently delete {n} selected tasks? This cannot be undone.", { n: count }))) return Promise.resolve();
+      if (!window.confirm(tx(t, "trash.confirmMany", "Archive {n} selected tasks?", { n: count }))) return Promise.resolve();
       const ids = Array.from(selectedIds);
       setSelectedIds(new Set());
       return Promise.all(ids.map(function (id) {
-        return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}`, { method: "DELETE" });
+        return SDK.fetchJSON(`${API}/tasks/${encodeURIComponent(id)}/archive`, { method: "POST" });
       })).then(function () {
         loadBoard();
       }).catch(function (e) { setError(String(e.message || e)); });
@@ -2303,8 +2303,8 @@
         },
         size: "sm",
         variant: "destructive",
-        title: "Permanently delete selected tasks. This cannot be undone.",
-      }, tx(t, "delete", "Delete")),
+        title: "Archive selected tasks.",
+      }, tx(t, "archive", "Archive")),
       h("div", { className: "hermes-kanban-bulk-priority",
                  title: "Set priority on selected tasks. Higher = claimed first." },
         h(Input, {
@@ -2400,7 +2400,7 @@
       const taskId = e.dataTransfer.getData(MIME_TASK);
       if (!taskId) return;
       if (props.selectedIds && props.selectedIds.has(taskId) && props.selectedIds.size > 1) {
-        if (window.confirm(tx(t, "trash.confirmMany", "Permanently delete {n} selected tasks? This cannot be undone.", { n: props.selectedIds.size }))) {
+        if (window.confirm(tx(t, "trash.confirmMany", "Archive {n} selected tasks?", { n: props.selectedIds.size }))) {
           const ids = Array.from(props.selectedIds);
           Promise.all(ids.map(function (id) { return props.onDelete(id); })).catch(function () {});
         }

@@ -253,7 +253,7 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 # SQLite safe copy
 # ---------------------------------------------------------------------------
 
-def _safe_copy_db(src: Path, dst: Path) -> bool:
+def safe_copy_sqlite_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
 
     Handles WAL mode — produces a consistent snapshot even while
@@ -281,6 +281,11 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
                     connection.close()
                 except Exception:
                     pass
+
+
+# Backward-compatible private name used by existing backup/import callers and
+# tests.  New storage workflows should use the public descriptive name above.
+_safe_copy_db = safe_copy_sqlite_db
 
 
 # ---------------------------------------------------------------------------

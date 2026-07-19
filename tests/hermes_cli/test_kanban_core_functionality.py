@@ -772,7 +772,7 @@ def test_cli_archive_bulk(kanban_home):
         conn.close()
 
 
-def test_cli_archive_rm_deletes_archived_tasks(kanban_home):
+def test_cli_archive_rm_previews_without_deleting_archived_tasks(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="gone")
@@ -780,10 +780,11 @@ def test_cli_archive_rm_deletes_archived_tasks(kanban_home):
     finally:
         conn.close()
     out = run_slash(f"archive --rm {tid}")
-    assert f"Deleted {tid}" in out
+    assert "Purge preview" in out
+    assert tid in out
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, tid) is None
+        assert kb.get_task(conn, tid) is not None
     finally:
         conn.close()
 
@@ -795,7 +796,7 @@ def test_cli_archive_rm_rejects_live_tasks(kanban_home):
     finally:
         conn.close()
     out = run_slash(f"archive --rm {tid}")
-    assert "cannot delete" in out.lower()
+    assert "must already be archived" in out.lower()
     conn = kb.connect()
     try:
         assert kb.get_task(conn, tid) is not None

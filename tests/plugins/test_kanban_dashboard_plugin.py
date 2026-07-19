@@ -660,21 +660,22 @@ def test_patch_status_running_rejected(client):
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 
-def test_delete_task(client):
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
+def test_delete_task_is_non_mutating_and_requires_archive_then_cli_purge(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "must-survive"}).json()["task"]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
-    assert r.status_code == 200
-    assert r.json()["deleted"] is True
-    assert r.json()["task_id"] == t["id"]
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "archive_required"
 
-    # Gone from board
-    board = client.get("/api/plugins/kanban/board").json()
-    all_ids = [tt["id"] for col in board["columns"] for tt in col["tasks"]]
-    assert t["id"] not in all_ids
+    archived = client.post(f"/api/plugins/kanban/tasks/{t['id']}/archive")
+    assert archived.status_code == 200
+    assert archived.json() == {"archived": True, "task_id": t["id"]}
 
-    # Gone from detail
-    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
-    assert r.status_code == 404
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "use_kanban_purge_preview"
+    detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["task"]["status"] == "archived"
 
 
 def test_delete_task_not_found(client):

@@ -937,18 +937,42 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
 
 # ---------------------------------------------------------------------------
-# DELETE /tasks/:id
+# Archive / legacy DELETE safety
 # ---------------------------------------------------------------------------
+
+@router.post("/tasks/{task_id}/archive")
+def archive_task(task_id: str, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        if not kanban_db.archive_task(conn, task_id):
+            raise HTTPException(status_code=409, detail={"code": "already_archived"})
+        return {"archived": True, "task_id": task_id}
+    finally:
+        conn.close()
 
 @router.delete("/tasks/{task_id}")
 def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.delete_task(conn, task_id)
-        if not ok:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        return {"deleted": True, "task_id": task_id}
+        if task.status != "archived":
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "archive_required", "message": "Archive the task before purge preview."},
+            )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "use_kanban_purge_preview",
+                "message": f"Use `hermes kanban purge {task_id}`; dashboard hard delete is unavailable.",
+            },
+        )
     finally:
         conn.close()
 
