@@ -803,6 +803,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 # ---------------------------------------------------------------------------
 
 class UpdateTaskBody(BaseModel):
+    expected_revision: int
     status: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
@@ -822,115 +823,139 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        task = kanban_db.get_task(conn, task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-
-        # A running task is owned by its exact worker run. Dashboard edits,
-        # reassignment, and drag/drop transitions must not invalidate the
-        # worker's prompt or silently reclaim it. Recovery is explicit via
-        # the canonical reclaim/cancel commands.
-        running_edit = {"assignee", "priority", "title", "body"} & payload.model_fields_set
-        running_transition = (
-            "status" in payload.model_fields_set and payload.status != "done"
-        )
-        if task.status == "running" and (running_edit or running_transition):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Task is running and owned by its current worker; "
-                    "use explicit reclaim or cancel recovery"
-                ),
-            )
-
-        # --- assignee ----------------------------------------------------
-        if payload.assignee is not None:
-            try:
-                ok = kanban_db.assign_task(
-                    conn, task_id, payload.assignee or None,
-                )
-            except RuntimeError as e:
-                raise HTTPException(status_code=409, detail=str(e))
-            if not ok:
-                raise HTTPException(status_code=404, detail="task not found")
-
-        # --- status -------------------------------------------------------
-        if payload.status is not None:
-            s = payload.status
-            ok = True
-            if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
-            elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
-            elif s == "scheduled":
-                ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
-            elif s == "ready":
-                # Re-open or promote through canonical dependency-aware helpers.
-                current = kanban_db.get_task(conn, task_id)
-                if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
-                elif current and current.status == "todo":
-                    ok, _ = kanban_db.promote_task(
-                        conn, task_id, actor="dashboard", force=False,
-                    )
-                elif current and current.status == "ready":
-                    ok = True
-                else:
-                    # Preserve compatibility for non-running legacy drag/drop
-                    # sources that do not have a canonical transition helper.
-                    ok = _set_status_direct(conn, task_id, "ready")
-            elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
-            elif s == "running":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
-                )
-            elif s in ("todo", "triage", "scheduled"):
-                ok = _set_status_direct(conn, task_id, s)
-            else:
-                raise HTTPException(status_code=400, detail=f"unknown status: {s}")
-            if not ok:
-                # For ``ready``, name the blocking parent(s) so the dashboard
-                # can render an actionable toast instead of a silent no-op.
-                # See #26744.
-                if s == "ready":
-                    blockers = _parents_blocking_ready(conn, task_id)
-                    if blockers:
-                        names = ", ".join(
-                            f"{p['title']!r} ({p['id']}, status={p['status']})"
-                            for p in blockers
-                        )
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Cannot move to 'ready': blocked by parent(s) "
-                                f"not done — {names}"
-                            ),
-                        )
+        with kanban_db.task_command_transaction(conn):
+            task = kanban_db.get_task(conn, task_id)
+            if task is None:
+                raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+            if task.revision != payload.expected_revision:
+                raise HTTPException(status_code=409, detail="task revision changed; reload and retry")
+            mutation_fields = payload.model_fields_set - {"expected_revision"}
+            if task.status == "running" and mutation_fields:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"status transition to {s!r} not valid from current state",
+                    detail=(
+                        "Task is running and owned by its current worker; "
+                        "use exact run-bound cancel or explicit reclaim recovery"
+                    ),
                 )
 
-        # --- canonical atomic field edit ---------------------------------
-        edit_kwargs = {
-            field: getattr(payload, field)
-            for field in ("title", "body", "priority")
-            if field in payload.model_fields_set and getattr(payload, field) is not None
-        }
-        if edit_kwargs:
-            try:
-                kanban_db.edit_task_fields(conn, task_id, **edit_kwargs)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc))
-            except kanban_db.TaskCommandConflict as exc:
-                raise HTTPException(status_code=409, detail=exc.detail)
+            if payload.assignee is not None:
+                try:
+                    ok = kanban_db.assign_task(
+                        conn,
+                        task_id,
+                        payload.assignee or None,
+                        transaction_owned=True,
+                    )
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
+                if not ok:
+                    raise HTTPException(status_code=404, detail="task not found")
+
+            if payload.status is not None:
+                s = payload.status
+                ok = True
+                if s == "done":
+                    ok = kanban_db.complete_task(
+                        conn,
+                        task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                        transaction_owned=True,
+                    )
+                elif s == "blocked":
+                    ok = kanban_db.block_task(
+                        conn,
+                        task_id,
+                        reason=payload.block_reason,
+                        transaction_owned=True,
+                    )
+                elif s == "scheduled":
+                    ok = kanban_db.schedule_task(
+                        conn,
+                        task_id,
+                        reason=payload.block_reason,
+                        transaction_owned=True,
+                    )
+                elif s == "ready":
+                    current = kanban_db.get_task(conn, task_id)
+                    if current and current.status in ("blocked", "scheduled"):
+                        ok = kanban_db.unblock_task(
+                            conn, task_id, transaction_owned=True
+                        )
+                    elif current and current.status == "todo":
+                        ok, _ = kanban_db.promote_task(
+                            conn,
+                            task_id,
+                            actor="dashboard",
+                            force=False,
+                            transaction_owned=True,
+                        )
+                    elif current and current.status == "ready":
+                        ok = True
+                    else:
+                        ok = _set_status_direct(
+                            conn, task_id, "ready", transaction_owned=True
+                        )
+                elif s == "archived":
+                    ok = kanban_db.archive_task(
+                        conn, task_id, transaction_owned=True
+                    )
+                elif s == "running":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
+                    )
+                elif s in ("todo", "triage"):
+                    ok = _set_status_direct(
+                        conn, task_id, s, transaction_owned=True
+                    )
+                else:
+                    raise HTTPException(status_code=400, detail=f"unknown status: {s}")
+                if not ok:
+                    if s == "ready":
+                        blockers = _parents_blocking_ready(conn, task_id)
+                        if blockers:
+                            names = ", ".join(
+                                f"{p['title']!r} ({p['id']}, status={p['status']})"
+                                for p in blockers
+                            )
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    "Cannot move to 'ready': blocked by parent(s) "
+                                    f"not done — {names}"
+                                ),
+                            )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"status transition to {s!r} not valid from current state",
+                    )
+
+            edit_kwargs = {
+                field: getattr(payload, field)
+                for field in ("title", "body", "priority")
+                if field in payload.model_fields_set
+            }
+            if edit_kwargs:
+                try:
+                    kanban_db.edit_task_fields(
+                        conn,
+                        task_id,
+                        transaction_owned=True,
+                        **edit_kwargs,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+                except kanban_db.TaskCommandConflict as exc:
+                    raise HTTPException(status_code=409, detail=exc.detail)
+
+        if payload.status == "done":
+            # Child promotion and workspace cleanup must observe the committed
+            # completion rather than opening nested transactions.
+            kanban_db.recompute_ready(conn)
+            kanban_db._cleanup_workspace(conn, task_id)
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
@@ -1003,7 +1028,11 @@ def _parents_blocking_ready(
 
 
 def _set_status_direct(
-    conn: sqlite3.Connection, task_id: str, new_status: str,
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    transaction_owned: bool = False,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
@@ -1015,7 +1044,7 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
-    with kanban_db.write_txn(conn):
+    with kanban_db._command_transaction(conn, transaction_owned):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
             "SELECT status, current_run_id FROM tasks WHERE id = ?",

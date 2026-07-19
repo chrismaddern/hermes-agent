@@ -21,6 +21,22 @@ from fastapi.testclient import TestClient
 from hermes_cli import kanban_db as kb
 
 
+class RevisionAwareTestClient(TestClient):
+    """Mirror the dashboard client: attach the latest task revision to PATCH."""
+
+    def patch(self, url, *, json=None, **kwargs):
+        if (
+            "/tasks/" in str(url)
+            and "/boards/" not in str(url)
+            and isinstance(json, dict)
+            and "expected_revision" not in json
+        ):
+            detail = self.get(url)
+            if detail.status_code == 200:
+                json = {"expected_revision": detail.json()["task"]["revision"], **json}
+        return super().patch(url, json=json, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -57,7 +73,7 @@ def kanban_home(tmp_path, monkeypatch):
 def client(kanban_home):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
-    return TestClient(app)
+    return RevisionAwareTestClient(app)
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +671,58 @@ def test_patch_fields_are_atomic_and_running_task_is_not_editable(client):
         f"/api/plugins/kanban/tasks/{t['id']}"
     ).json()["task"]
     assert unchanged["title"] == "x"
+
+
+def test_patch_requires_revision_and_rolls_back_assignment_when_field_validation_fails(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "before", "assignee": "old"}
+    ).json()["task"]
+
+    missing = client.request(
+        "PATCH",
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"title": "after"},
+    )
+    assert missing.status_code == 422
+
+    invalid = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "expected_revision": task["revision"],
+            "assignee": "new",
+            "title": "   ",
+        },
+    )
+    assert invalid.status_code == 400
+    unchanged = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()["task"]
+    assert unchanged["assignee"] == "old"
+    assert unchanged["title"] == "before"
+
+
+@pytest.mark.parametrize("patch", [
+    {"status": "done"},
+    {"priority": 9},
+    {"assignee": "other"},
+])
+def test_dashboard_patch_rejects_every_running_mutation(client, patch):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    with kb.connect() as conn:
+        claimed = kb.claim_task(
+            conn, task["id"], claimer=f"{kb._claimer_id().split(':', 1)[0]}:999"
+        )
+        assert claimed is not None
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"expected_revision": claimed.revision, **patch},
+    )
+    assert response.status_code == 409
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task["id"])
+    assert current.status == "running"
+    assert current.current_run_id == claimed.current_run_id
 
 
 def test_dashboard_cannot_drag_running_task_to_ready(client):
@@ -1502,15 +1570,10 @@ def test_task_detail_runs_empty_before_claim(client):
 def test_patch_status_done_with_summary_and_metadata(client):
     """PATCH /tasks/:id with status=done + summary + metadata must
     reach complete_task, so the dashboard has CLI parity."""
-    # Create + claim.
+    # Manual completion is allowed only before a worker owns the task.
     r = client.post("/api/plugins/kanban/tasks", json={"title": "x", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        kb.claim_task(conn, tid)
-    finally:
-        conn.close()
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{tid}",
@@ -1538,11 +1601,6 @@ def test_patch_status_done_without_summary_still_works(client):
     r = client.post("/api/plugins/kanban/tasks", json={"title": "y", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        kb.claim_task(conn, tid)
-    finally:
-        conn.close()
     r = client.patch(
         f"/api/plugins/kanban/tasks/{tid}",
         json={"status": "done", "result": "legacy shape"},

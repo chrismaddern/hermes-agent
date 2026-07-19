@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -3189,19 +3189,19 @@ def _command_transaction(conn: sqlite3.Connection, transaction_owned: bool):
     return write_txn(conn)
 
 
+def task_command_transaction(conn: sqlite3.Connection):
+    """Open one caller-owned command transaction for mutation plus receipt."""
+    return _command_transaction(conn, False)
+
+
 @contextlib.contextmanager
 def _bounded_cancel_transaction(
-    conn: sqlite3.Connection, transaction_owned: bool
+    conn: sqlite3.Connection,
+    commit_recovery: Optional[Callable[[], Any]] = None,
 ):
     """Use one SQLite busy-timeout window for a standalone cancellation."""
-    if transaction_owned:
-        with _command_transaction(conn, True):
-            yield conn
-        return
     if conn.in_transaction:
-        raise RuntimeError(
-            "connection already has a transaction; pass transaction_owned=True"
-        )
+        raise RuntimeError("cancellation requires an internally owned transaction")
 
     # Unlike general Kanban writes, cancellation must not multiply its
     # configured 10-second busy timeout through boundary retries.
@@ -3213,6 +3213,8 @@ def _bounded_cancel_transaction(
             conn.execute("ROLLBACK")
         except sqlite3.OperationalError:
             pass
+        if commit_recovery is not None:
+            commit_recovery()
         raise
     else:
         try:
@@ -3222,7 +3224,11 @@ def _bounded_cancel_transaction(
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
-            raise
+            if commit_recovery is None:
+                raise
+            # Process termination is irreversible. Re-run the exact CAS-bound
+            # durable finalization before control can return to the caller.
+            commit_recovery()
         _check_file_length_invariant(conn)
 
 
@@ -3406,6 +3412,7 @@ def assign_task(
     profile: Optional[str],
     *,
     expected_revision: Optional[int] = None,
+    transaction_owned: bool = False,
 ) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
@@ -3413,7 +3420,7 @@ def assign_task(
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
-    with write_txn(conn):
+    with _command_transaction(conn, transaction_owned):
         row = conn.execute(
             "SELECT status, claim_lock, assignee, revision FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -4613,6 +4620,8 @@ def _cancel_worker_identity_matches(
     *,
     expected_run_id: int,
     expected_claim_lock: str,
+    expected_db_path: str,
+    expected_board: str,
 ) -> bool:
     """Fail-closed proof that PID is this task's isolated Hermes worker."""
     if not pid or pid <= 0:
@@ -4627,6 +4636,20 @@ def _cancel_worker_identity_matches(
         if environment.get("HERMES_KANBAN_RUN_ID") != str(expected_run_id):
             return False
         if environment.get("HERMES_KANBAN_CLAIM_LOCK") != expected_claim_lock:
+            return False
+        worker_db = environment.get("HERMES_KANBAN_DB", "")
+        if not worker_db or Path(worker_db).expanduser().resolve(strict=False) != Path(
+            expected_db_path
+        ).expanduser().resolve(strict=False):
+            return False
+        try:
+            worker_board = _normalize_board_slug(
+                environment.get("HERMES_KANBAN_BOARD", "")
+            )
+            canonical_board = _normalize_board_slug(expected_board)
+        except ValueError:
+            return False
+        if not worker_board or worker_board != canonical_board:
             return False
         command = " ".join(process.cmdline())
         if task_id not in command or "work kanban task" not in command:
@@ -4756,31 +4779,101 @@ def _terminate_cancel_worker_group(pid: int) -> Optional[str]:
     return None
 
 
+def _finalize_cancel_in_transaction(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    claim_lock: str,
+    worker_pid: int,
+    actual_revision: int,
+    worker_effect: str,
+    success_receipt: Optional[Callable[[sqlite3.Connection, CancelTaskResult], Any]],
+) -> CancelTaskResult:
+    """CAS-finalize one identity-proven stopped worker inside an active txn."""
+    now = int(time.time())
+    run_update = conn.execute(
+        """
+        UPDATE task_runs
+           SET status = 'cancelled', outcome = 'cancelled',
+               summary = 'Cancelled by operator.', ended_at = ?,
+               claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+         WHERE id = ? AND task_id = ? AND status = 'running'
+           AND ended_at IS NULL AND claim_lock = ? AND worker_pid = ?
+        """,
+        (now, expected_run_id, task_id, claim_lock, worker_pid),
+    )
+    if run_update.rowcount != 1:
+        raise TaskCommandConflict(
+            "run_changed", "the active run changed before cancellation"
+        )
+    task_update = conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'blocked', block_kind = 'needs_input',
+               current_run_id = NULL, claim_lock = NULL,
+               claim_expires = NULL, worker_pid = NULL
+         WHERE id = ? AND status = 'running' AND revision = ?
+           AND current_run_id = ? AND claim_lock = ? AND worker_pid = ?
+        """,
+        (task_id, actual_revision, expected_run_id, claim_lock, worker_pid),
+    )
+    if task_update.rowcount != 1:
+        raise TaskCommandConflict(
+            "run_changed", "the task claim changed before cancellation"
+        )
+    _append_event(
+        conn,
+        task_id,
+        "cancelled_by_operator",
+        {"worker_effect": worker_effect},
+        run_id=expected_run_id,
+    )
+    revision = int(conn.execute(
+        "SELECT revision FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()["revision"])
+    result = CancelTaskResult(
+        applied=True,
+        revision=revision,
+        run_id=expected_run_id,
+        worker_effect=worker_effect,
+    )
+    if success_receipt is not None:
+        success_receipt(conn, result)
+    return result
+
+
 def cancel_running_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     expected_run_id: int,
     expected_revision: Optional[int] = None,
-    transaction_owned: bool = False,
+    expected_board: Optional[str] = None,
+    success_receipt: Optional[
+        Callable[[sqlite3.Connection, CancelTaskResult], Any]
+    ] = None,
 ) -> CancelTaskResult:
     """Stop the exact local worker run and atomically leave its task blocked.
 
-    The write transaction remains held throughout identity proof, bounded
-    process-group termination, run closure, task transition, and event append.
-    ``transaction_owned=True`` lets an API caller add its receipt before it
-    commits the same transaction.
+    Cancellation always owns its SQLite transaction. ``success_receipt`` is a
+    bounded caller callback that inserts durable idempotency evidence using the
+    supplied connection after mutation and before that same internal commit.
+    If COMMIT fails after a worker was stopped, the exact CAS-bound finalization
+    and receipt callback are retried before this function may return.
     """
     if not isinstance(expected_run_id, int) or isinstance(expected_run_id, bool):
         raise ValueError("expected_run_id must be a positive integer")
     if expected_run_id <= 0:
         raise ValueError("expected_run_id must be a positive integer")
+    if conn.in_transaction:
+        raise RuntimeError("cancellation requires an internally owned transaction")
 
     old_busy_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
-    if not transaction_owned:
-        conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA busy_timeout=10000")
+    recovery: Optional[Callable[[], Any]] = None
     try:
-        with _bounded_cancel_transaction(conn, transaction_owned):
+        with _bounded_cancel_transaction(conn, lambda: recovery() if recovery else None):
             row = conn.execute(
                 """
                 SELECT t.status, t.revision, t.current_run_id,
@@ -4817,6 +4910,13 @@ def cancel_running_task(
                 )
             claim_lock = str(row["claim_lock"])
             worker_pid = int(row["worker_pid"])
+            db_record = next(
+                record
+                for record in conn.execute("PRAGMA database_list").fetchall()
+                if record[1] == "main"
+            )
+            db_path = str(Path(db_record[2]).expanduser().resolve(strict=False))
+            board_name = _normalize_board_slug(expected_board) or get_current_board()
             if not _claim_host_is_local(claim_lock):
                 raise TaskCommandConflict(
                     "worker_foreign", "the active worker is owned by another host"
@@ -4844,6 +4944,8 @@ def cancel_running_task(
                     task_id,
                     expected_run_id=expected_run_id,
                     expected_claim_lock=claim_lock,
+                    expected_db_path=db_path,
+                    expected_board=board_name,
                 ):
                     raise TaskCommandConflict(
                         "worker_identity_mismatch",
@@ -4856,59 +4958,49 @@ def cancel_running_task(
                         "the worker process group could not be confirmed stopped",
                     )
 
-            now = int(time.time())
-            run_update = conn.execute(
-                """
-                UPDATE task_runs
-                   SET status = 'cancelled', outcome = 'cancelled',
-                       summary = 'Cancelled by operator.', ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND task_id = ? AND status = 'running'
-                   AND ended_at IS NULL AND claim_lock = ? AND worker_pid = ?
-                """,
-                (now, expected_run_id, task_id, claim_lock, worker_pid),
-            )
-            if run_update.rowcount != 1:
-                raise TaskCommandConflict(
-                    "run_changed", "the active run changed before cancellation"
-                )
-            task_update = conn.execute(
-                """
-                UPDATE tasks
-                   SET status = 'blocked', block_kind = 'needs_input',
-                       current_run_id = NULL, claim_lock = NULL,
-                       claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND status = 'running' AND revision = ?
-                   AND current_run_id = ? AND claim_lock = ? AND worker_pid = ?
-                """,
-                (
-                    task_id, actual_revision, expected_run_id,
-                    claim_lock, worker_pid,
-                ),
-            )
-            if task_update.rowcount != 1:
-                raise TaskCommandConflict(
-                    "run_changed", "the task claim changed before cancellation"
-                )
-            _append_event(
+            def recover_commit() -> None:
+                try:
+                    with _bounded_cancel_transaction(conn):
+                        _finalize_cancel_in_transaction(
+                            conn,
+                            task_id,
+                            expected_run_id=expected_run_id,
+                            claim_lock=claim_lock,
+                            worker_pid=worker_pid,
+                            actual_revision=actual_revision,
+                            worker_effect=worker_effect,
+                            success_receipt=success_receipt,
+                        )
+                except Exception:
+                    # Caller receipt failure cannot resurrect a process already
+                    # stopped. Persist terminal task/run state without claiming
+                    # command success, then propagate the receipt error.
+                    with _bounded_cancel_transaction(conn):
+                        _finalize_cancel_in_transaction(
+                            conn,
+                            task_id,
+                            expected_run_id=expected_run_id,
+                            claim_lock=claim_lock,
+                            worker_pid=worker_pid,
+                            actual_revision=actual_revision,
+                            worker_effect=worker_effect,
+                            success_receipt=None,
+                        )
+                    raise
+
+            recovery = recover_commit
+            return _finalize_cancel_in_transaction(
                 conn,
                 task_id,
-                "cancelled_by_operator",
-                {"worker_effect": worker_effect},
-                run_id=expected_run_id,
-            )
-            revision = int(conn.execute(
-                "SELECT revision FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()["revision"])
-            return CancelTaskResult(
-                applied=True,
-                revision=revision,
-                run_id=expected_run_id,
+                expected_run_id=expected_run_id,
+                claim_lock=claim_lock,
+                worker_pid=worker_pid,
+                actual_revision=actual_revision,
                 worker_effect=worker_effect,
+                success_receipt=success_receipt,
             )
     finally:
-        if not transaction_owned:
-            conn.execute(f"PRAGMA busy_timeout={old_busy_timeout}")
+        conn.execute(f"PRAGMA busy_timeout={old_busy_timeout}")
 
 
 def reassign_task(
@@ -5087,6 +5179,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    transaction_owned: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -5148,7 +5241,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    with _command_transaction(conn, transaction_owned):
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -5246,6 +5339,29 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+    # Caller-owned command transactions keep all remaining durable writes in
+    # the same transaction and defer non-transactional side effects until the
+    # caller commits.
+    if transaction_owned:
+        scan_text = " ".join(filter(None, [summary, result]))
+        if scan_text:
+            phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+            phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
+            if phantom_refs:
+                _append_event(
+                    conn,
+                    task_id,
+                    "suspected_hallucinated_references",
+                    {"phantom_refs": phantom_refs, "source": "completion_summary"},
+                    run_id=run_id,
+                )
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        return True
+
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -5868,6 +5984,7 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     expected_revision: Optional[int] = None,
+    transaction_owned: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5902,7 +6019,7 @@ def block_task(
         )
     routed_to = "blocked"
     recurrences = 0
-    with write_txn(conn):
+    with _command_transaction(conn, transaction_owned):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences, revision "
             "FROM tasks WHERE id = ?",
@@ -6094,6 +6211,7 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
     expected_revision: Optional[int] = None,
+    transaction_owned: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """Manually promote a `todo` or `blocked` task to `ready`.
 
@@ -6167,7 +6285,7 @@ def promote_task(
         return _evaluate(apply=False)
     # Eligibility (including dependencies and revision) and mutation share one
     # write transaction so a newly-linked parent cannot race the promotion.
-    with write_txn(conn):
+    with _command_transaction(conn, transaction_owned):
         return _evaluate(apply=True)
 
 
@@ -6176,6 +6294,7 @@ def unblock_task(
     task_id: str,
     *,
     expected_revision: Optional[int] = None,
+    transaction_owned: bool = False,
 ) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
@@ -6187,7 +6306,7 @@ def unblock_task(
     state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
-    with write_txn(conn):
+    with _command_transaction(conn, transaction_owned):
         stale = conn.execute(
             "SELECT current_run_id, revision, status FROM tasks WHERE id = ?",
             (task_id,),
@@ -6571,8 +6690,9 @@ def archive_task(
     task_id: str,
     *,
     expected_revision: Optional[int] = None,
+    transaction_owned: bool = False,
 ) -> bool:
-    with write_txn(conn):
+    with _command_transaction(conn, transaction_owned):
         row = conn.execute(
             "SELECT revision, status FROM tasks WHERE id = ?",
             (task_id,),
@@ -6603,9 +6723,10 @@ def archive_task(
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents no longer block children, same as ``done``.
-    # Promote newly-unblocked dependents immediately instead of waiting
-    # for a later dispatcher tick.
-    recompute_ready(conn)
+    # Caller-owned command transactions defer promotion until their receipt is
+    # committed; standalone callers retain the historical eager recompute.
+    if not transaction_owned:
+        recompute_ready(conn)
     return True
 
 
@@ -6967,6 +7088,7 @@ def schedule_task(
     *,
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    transaction_owned: bool = False,
 ) -> bool:
     """Park a task in ``scheduled`` so it is waiting on time, not human input.
 
@@ -6974,7 +7096,7 @@ def schedule_task(
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
-    with write_txn(conn):
+    with _command_transaction(conn, transaction_owned):
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks

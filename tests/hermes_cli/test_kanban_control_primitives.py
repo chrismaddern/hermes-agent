@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import signal
 import sqlite3
@@ -366,6 +367,58 @@ def test_default_lifecycle_helper_calls_remain_backward_compatible(board):
     assert kb.unblock_task(board, task_id)
 
 
+@pytest.mark.parametrize("command", ["assign", "block", "unblock", "promote", "archive"])
+def test_lifecycle_command_and_caller_receipt_commit_or_rollback_together(board, command):
+    task_id = kb.create_task(board, title=command)
+    if command == "unblock":
+        assert kb.block_task(board, task_id, reason="prepare")
+        source_status, result_status = "blocked", "ready"
+    elif command == "promote":
+        board.execute("UPDATE tasks SET status='todo' WHERE id=?", (task_id,))
+        source_status, result_status = "todo", "ready"
+    elif command == "archive":
+        board.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+        source_status, result_status = "done", "archived"
+    else:
+        source_status = "ready"
+        result_status = "blocked" if command == "block" else "ready"
+
+    board.execute("CREATE TABLE IF NOT EXISTS command_receipts (command TEXT UNIQUE)")
+
+    def apply():
+        if command == "assign":
+            return kb.assign_task(board, task_id, "reviewer", transaction_owned=True)
+        if command == "block":
+            return kb.block_task(board, task_id, reason="wait", transaction_owned=True)
+        if command == "unblock":
+            return kb.unblock_task(board, task_id, transaction_owned=True)
+        if command == "promote":
+            return kb.promote_task(
+                board, task_id, actor="control", transaction_owned=True
+            )[0]
+        return kb.archive_task(board, task_id, transaction_owned=True)
+
+    board.execute("BEGIN IMMEDIATE")
+    assert apply()
+    board.execute("INSERT INTO command_receipts VALUES (?)", (command,))
+    board.execute("ROLLBACK")
+    rolled_back = kb.get_task(board, task_id)
+    assert rolled_back.status == source_status
+    assert rolled_back.assignee is None
+    assert board.execute("SELECT 1 FROM command_receipts").fetchone() is None
+
+    with kb.task_command_transaction(board):
+        assert apply()
+        board.execute("INSERT INTO command_receipts VALUES (?)", (command,))
+    committed = kb.get_task(board, task_id)
+    assert committed.status == result_status
+    if command == "assign":
+        assert committed.assignee == "reviewer"
+    assert board.execute(
+        "SELECT command FROM command_receipts WHERE command=?", (command,)
+    ).fetchone()[0] == command
+
+
 def _running_task(board, monkeypatch, *, pid=424242, claim_lock=None):
     if claim_lock is None:
         claim_lock = f"{kb._claimer_id().split(':', 1)[0]}:999"
@@ -529,21 +582,101 @@ def test_cancel_running_task_binds_revision_run_claim_and_pid(board, monkeypatch
     assert kb.get_task(board, task_id).status == "running"
 
 
-def test_cancel_running_task_can_join_caller_owned_transaction(board, monkeypatch):
+def test_cancel_running_task_owns_commit_and_persists_caller_receipt(board, monkeypatch):
     task_id, task = _running_task(board, monkeypatch)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
     monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: False)
+    board.execute("CREATE TABLE receipts (task_id TEXT, revision INTEGER)")
 
-    board.execute("BEGIN IMMEDIATE")
-    kb.cancel_running_task(
+    result = kb.cancel_running_task(
         board,
         task_id,
         expected_run_id=task.current_run_id,
         expected_revision=task.revision,
-        transaction_owned=True,
+        success_receipt=lambda conn, applied: conn.execute(
+            "INSERT INTO receipts VALUES (?, ?)", (task_id, applied.revision)
+        ),
     )
-    board.execute("ROLLBACK")
-    assert kb.get_task(board, task_id).status == "running"
+
+    assert kb.get_task(board, task_id).status == "blocked"
+    assert tuple(board.execute("SELECT * FROM receipts").fetchone()) == (
+        task_id,
+        result.revision,
+    )
+
+
+def test_cancel_commit_failure_recovers_durable_terminal_state_and_receipt(
+    board, monkeypatch
+):
+    task_id, task = _running_task(board, monkeypatch)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: True)
+    monkeypatch.setattr(kb, "_cancel_worker_identity_matches", lambda *a, **k: True)
+    monkeypatch.setattr(kb, "_terminate_cancel_worker_group", lambda pid: "stopped")
+    board.execute("CREATE TABLE receipts (task_id TEXT UNIQUE)")
+    attempts = 0
+
+    @contextlib.contextmanager
+    def fail_first_commit(conn, commit_recovery=None):
+        nonlocal attempts
+        attempts += 1
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        if attempts == 1:
+            conn.execute("ROLLBACK")
+            assert commit_recovery is not None
+            commit_recovery()
+        else:
+            conn.execute("COMMIT")
+
+    monkeypatch.setattr(kb, "_bounded_cancel_transaction", fail_first_commit)
+
+    result = kb.cancel_running_task(
+        board,
+        task_id,
+        expected_run_id=task.current_run_id,
+        expected_revision=task.revision,
+        success_receipt=lambda conn, _result: conn.execute(
+            "INSERT INTO receipts VALUES (?)", (task_id,)
+        ),
+    )
+
+    assert attempts == 2
+    assert result.worker_effect == "stopped"
+    assert kb.get_task(board, task_id).status == "blocked"
+    assert board.execute("SELECT task_id FROM receipts").fetchone()[0] == task_id
+
+
+def test_cancel_receipt_failure_still_persists_stopped_terminal_state(board, monkeypatch):
+    task_id, task = _running_task(board, monkeypatch)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb, "_process_group_alive", lambda pgid: True)
+    monkeypatch.setattr(kb, "_cancel_worker_identity_matches", lambda *a, **k: True)
+    monkeypatch.setattr(kb, "_terminate_cancel_worker_group", lambda pid: "stopped")
+
+    def reject_receipt(_conn, _result):
+        raise sqlite3.OperationalError("receipt unavailable")
+
+    with pytest.raises(sqlite3.OperationalError, match="receipt unavailable"):
+        kb.cancel_running_task(
+            board,
+            task_id,
+            expected_run_id=task.current_run_id,
+            expected_revision=task.revision,
+            success_receipt=reject_receipt,
+        )
+
+    cancelled = kb.get_task(board, task_id)
+    run = board.execute(
+        "SELECT status, outcome FROM task_runs WHERE id=?", (task.current_run_id,)
+    ).fetchone()
+    assert cancelled.status == "blocked"
+    assert cancelled.current_run_id is None
+    assert tuple(run) == ("cancelled", "cancelled")
 
 
 def test_cancel_standalone_transaction_does_not_retry_busy_window(board, monkeypatch):
@@ -649,6 +782,39 @@ def test_cancel_identity_binds_task_run_and_claim(
         "t_same",
         expected_run_id=9001,
         expected_claim_lock="local:expected",
+        expected_db_path="/boards/canonical.db",
+        expected_board="canonical",
+    )
+
+
+def test_cancel_identity_rejects_same_task_run_claim_on_foreign_board(monkeypatch):
+    class Process:
+        def __init__(self, _pid):
+            pass
+
+        def environ(self):
+            return {
+                "HERMES_KANBAN_TASK": "t_same",
+                "HERMES_KANBAN_RUN_ID": "9001",
+                "HERMES_KANBAN_CLAIM_LOCK": "local:expected",
+                "HERMES_KANBAN_DB": "/boards/foreign/../foreign.db",
+                "HERMES_KANBAN_BOARD": "foreign",
+            }
+
+        def cmdline(self):
+            return ["hermes", "work", "kanban", "task", "t_same"]
+
+    fake_psutil = types.SimpleNamespace(Process=Process, Error=RuntimeError)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(kb.os, "getpgid", lambda pid: pid)
+
+    assert not kb._cancel_worker_identity_matches(
+        424242,
+        "t_same",
+        expected_run_id=9001,
+        expected_claim_lock="local:expected",
+        expected_db_path="/boards/canonical.db",
+        expected_board="canonical",
     )
 
 
@@ -753,6 +919,10 @@ def test_cancel_identity_and_process_group_termination_against_real_worker(board
     env["HERMES_KANBAN_TASK"] = task_id
     env["HERMES_KANBAN_RUN_ID"] = str(claimed.current_run_id)
     env["HERMES_KANBAN_CLAIM_LOCK"] = claim_lock
+    env["HERMES_KANBAN_DB"] = str(
+        Path(board.execute("PRAGMA database_list").fetchone()[2]).resolve()
+    )
+    env["HERMES_KANBAN_BOARD"] = "default"
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -772,6 +942,8 @@ def test_cancel_identity_and_process_group_termination_against_real_worker(board
             task_id,
             expected_run_id=task.current_run_id,
             expected_claim_lock=claim_lock,
+            expected_db_path=env["HERMES_KANBAN_DB"],
+            expected_board="default",
         )
         result = kb.cancel_running_task(
             board,

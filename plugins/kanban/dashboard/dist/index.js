@@ -721,6 +721,14 @@
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       const patch = withCompletionSummary({ status: newStatus }, 1, t);
       if (!patch) return;
+      const sourceTask = boardData && boardData.columns
+        .flatMap(function (col) { return col.tasks; })
+        .find(function (candidate) { return candidate.id === taskId; });
+      if (!sourceTask || !Number.isInteger(sourceTask.revision)) {
+        setError(tx(t, "moveFailed", "Move failed: ") + "task revision unavailable; reload and retry");
+        return;
+      }
+      patch.expected_revision = sourceTask.revision;
       setBoardData(function (b) {
         if (!b) return b;
         let moved = null;
@@ -745,7 +753,7 @@
         setError(tx(t, "moveFailed", "Move failed: ") + parseApiErrorMessage(err));
         loadBoard();
       });
-    }, [loadBoard, board, t]);
+    }, [loadBoard, board, boardData, t]);
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -1348,7 +1356,7 @@
         SDK.fetchJSON(url, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status: "ready" }),
+          body: JSON.stringify({ expected_revision: task.revision, status: "ready" }),
         }).then(function () {
           setMsg({ ok: true, text: tx(t, "unblockedMessage",
             "Unblocked {id}. Task is ready for the next tick.", { id: task.id }) });
@@ -3250,6 +3258,11 @@
       }
       const finalPatch = withCompletionSummary(patch, 1);
       if (!finalPatch) return Promise.resolve();
+      if (!task || !Number.isInteger(task.revision)) {
+        setPatchErr("Task revision unavailable; reload and retry.");
+        return Promise.resolve();
+      }
+      finalPatch.expected_revision = task.revision;
       setPatchErr(null);
       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug), {
         method: "PATCH",
