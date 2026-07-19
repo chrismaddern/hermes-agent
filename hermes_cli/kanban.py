@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import getpass
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -646,8 +648,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         dest="purge_ids",
         nargs="+",
         default=None,
-        help="Permanently delete already-archived task ids from the board",
+        help="Preview purge for exactly one already-archived task",
     )
+
+    p_purge = sub.add_parser(
+        "purge",
+        help="Preview, confirm, or resume backed-up purge of one archived task",
+    )
+    p_purge.add_argument("task_id", nargs="?", help="Already-archived task id")
+    confirm_group = p_purge.add_mutually_exclusive_group()
+    confirm_group.add_argument(
+        "--confirm", action="store_true", help="Read the one-time token from a hidden TTY prompt"
+    )
+    confirm_group.add_argument(
+        "--confirm-stdin", action="store_true", help="Read exactly one token line from stdin"
+    )
+    p_purge.add_argument("--resume", metavar="OPERATION_ID", help="Resume an interrupted purge")
+    p_purge.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -1007,6 +1024,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "purge":    _cmd_purge,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -2248,16 +2266,17 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     if not ids and not purge_ids:
         print("at least one task_id is required", file=sys.stderr)
         return 1
+    if purge_ids:
+        if len(purge_ids) != 1:
+            print("archive --rm accepts exactly one task; purge tasks individually", file=sys.stderr)
+            return 1
+        print("archive --rm is now a safe purge-preview alias", file=sys.stderr)
+        return _cmd_purge(argparse.Namespace(
+            task_id=purge_ids[0], confirm=False, confirm_stdin=False,
+            resume=None, json=False,
+        ))
     failed: list[str] = []
     with kb.connect_closing() as conn:
-        if purge_ids:
-            for tid in purge_ids:
-                if not kb.delete_archived_task(conn, tid):
-                    failed.append(tid)
-                    print(f"cannot delete {tid} (must already be archived)", file=sys.stderr)
-                else:
-                    print(f"Deleted {tid}")
-            return 0 if not failed else 1
         for tid in ids:
             if not kb.archive_task(conn, tid):
                 failed.append(tid)
@@ -2265,6 +2284,109 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_purge(args: argparse.Namespace) -> int:
+    """Drive the CLI-only archived-task purge protocol."""
+    from hermes_cli import kanban_purge as purge
+
+    actor = _profile_author()
+    as_json = bool(getattr(args, "json", False))
+    operation_id = getattr(args, "resume", None)
+    task_id = getattr(args, "task_id", None)
+    if operation_id and task_id:
+        print("purge: TASK_ID and --resume are mutually exclusive", file=sys.stderr)
+        return 1
+    if operation_id and (getattr(args, "confirm", False) or getattr(args, "confirm_stdin", False)):
+        print("purge: --resume cannot be combined with confirmation", file=sys.stderr)
+        return 1
+    if not operation_id and not task_id:
+        print("purge: TASK_ID is required unless --resume is used", file=sys.stderr)
+        return 1
+
+    try:
+        with kb.connect_closing() as conn:
+            if operation_id:
+                result = purge.resume_purge(conn, operation_id)
+            elif not (getattr(args, "confirm", False) or getattr(args, "confirm_stdin", False)):
+                preview = purge.preview_purge(conn, task_id, actor=actor)
+                payload = {
+                    "operation_id": preview.operation_id,
+                    "task_id": preview.task_id,
+                    "status": preview.status.value,
+                    "expires_at": preview.expires_at,
+                    "confirmation_token": preview.confirmation_token,
+                    "counts": dict(preview.counts),
+                    "confirm_command": f"hermes kanban purge {preview.task_id} --confirm",
+                    "warning": "A mandatory owner-only purge backup retains the purged content.",
+                }
+                if as_json:
+                    print(json.dumps(payload, sort_keys=True))
+                else:
+                    print(f"Purge preview {preview.operation_id} for {preview.task_id}")
+                    print(f"Confirmation token (shown once): {preview.confirmation_token}")
+                    print(f"Expires: {preview.expires_at}")
+                    print(f"Counts: {json.dumps(dict(preview.counts), sort_keys=True)}")
+                    print(f"Confirm: {payload['confirm_command']}")
+                    print(payload["warning"])
+                return 0
+            else:
+                if getattr(args, "confirm_stdin", False):
+                    lines = sys.stdin.read().splitlines()
+                    if len(lines) != 1 or not lines[0]:
+                        print("purge: --confirm-stdin requires exactly one non-empty token line", file=sys.stderr)
+                        return 2
+                    token = lines[0]
+                else:
+                    if not sys.stdin.isatty():
+                        print("purge: --confirm requires a TTY; use --confirm-stdin for automation", file=sys.stderr)
+                        return 2
+                    token = getpass.getpass("Purge confirmation token: ")
+                row = conn.execute(
+                    "SELECT id FROM kanban_purge_operations "
+                    "WHERE task_id = ? AND actor = ? AND status = 'previewed' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (task_id, actor),
+                ).fetchone()
+                if row is None:
+                    print("purge: no active preview for this task and actor", file=sys.stderr)
+                    return 2
+                result = purge.confirm_purge(
+                    conn, task_id, operation_id=row["id"],
+                    confirmation_token=token, actor=actor,
+                )
+    except purge.PurgeCleanupPendingError as exc:
+        result = exc.result
+        resume_command = f"hermes kanban purge --resume {result.operation_id}"
+        payload = {
+            "operation_id": result.operation_id, "task_id": result.task_id,
+            "status": result.status.value, "backup_path": result.backup_path,
+            "resume_command": resume_command,
+        }
+        print(json.dumps(payload, sort_keys=True) if as_json else (
+            "Database purge committed; external cleanup pending. "
+            f"Resume with: {resume_command}"
+        ))
+        return 3
+    except purge.PurgeRollbackError as exc:
+        print(f"purge: {exc}", file=sys.stderr)
+        return 4
+    except purge.PurgeConfirmationError as exc:
+        print(f"purge: {exc}", file=sys.stderr)
+        return 2
+    except (purge.PurgeValidationError, OSError, sqlite3.Error) as exc:
+        print(f"purge: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "operation_id": result.operation_id, "task_id": result.task_id,
+        "status": result.status.value, "backup_path": result.backup_path,
+    }
+    if as_json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(f"Purge complete for {result.task_id}; backup retained at {result.backup_path}")
+    return result.exit_code
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:

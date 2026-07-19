@@ -628,6 +628,8 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `GET` | `/board?tenant=<name>&include_archived=…` | Full board grouped by status column, plus tenants + assignees for filter dropdowns |
 | `GET` | `/tasks/:id` | Task + comments + events + links |
 | `POST` | `/tasks` | Create (wraps `kanban_db.create_task`, accepts `triage: bool` and `parents: [id, …]`) |
+| `POST` | `/tasks/:id/archive` | Archive a task. Dashboard trash/drop/bulk actions use this archive-only route. |
+| `DELETE` | `/tasks/:id` | Non-mutating migration guard: `404` missing, otherwise `409` with `archive_required` or `use_kanban_purge_preview`. There is no web hard-purge shortcut. |
 | `PATCH` | `/tasks/:id` | Status / assignee / priority / title / body / result |
 | `POST` | `/tasks/bulk` | Apply the same patch (status / archive / assignee / priority) to every id in `ids`. Per-id failures reported without aborting siblings |
 | `POST` | `/tasks/:id/comments` | Append a comment |
@@ -723,6 +725,12 @@ hermes kanban complete <id>... [--result "..."]
 hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
+
+# Hard purge is deliberately one task at a time and requires prior archive.
+hermes kanban purge <id> [--json]                     # preview + one-time token
+hermes kanban purge <id> --confirm [--json]           # hidden TTY token prompt
+printf '%s\n' "$TOKEN" | hermes kanban purge <id> --confirm-stdin [--json]
+hermes kanban purge --resume <operation-id> [--json]
 
 hermes kanban tail <id>                                # follow a single task's event stream
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal

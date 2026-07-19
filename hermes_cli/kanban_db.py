@@ -1264,6 +1264,28 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Content-free control/audit state for the archived-task purge protocol.
+-- Deliberately has no FK to tasks: this row outlives the task it audits.
+CREATE TABLE IF NOT EXISTS kanban_purge_operations (
+    id                TEXT PRIMARY KEY,
+    task_id           TEXT NOT NULL,
+    actor             TEXT NOT NULL,
+    board_identity    TEXT NOT NULL,
+    manifest_digest   TEXT NOT NULL,
+    token_hash        TEXT,
+    status            TEXT NOT NULL,
+    counts_json       TEXT NOT NULL,
+    backup_id         TEXT,
+    backup_sha256     TEXT,
+    failure_code      TEXT,
+    created_at        INTEGER NOT NULL,
+    expires_at        INTEGER NOT NULL,
+    confirmed_at      INTEGER,
+    db_committed_at   INTEGER,
+    completed_at      INTEGER,
+    updated_at        INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1274,6 +1296,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_purge_task_created     ON kanban_purge_operations(task_id, created_at);
 """
 
 
@@ -5914,53 +5937,50 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Permanently remove an already-archived task and its related rows.
+def _delete_task_rows_in_txn(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Delete registered task rows inside a caller-owned write transaction.
 
-    Safety guard: only archived tasks can be deleted. Active / blocked / done
-    tasks must be explicitly archived first so accidental data loss requires a
-    second deliberate action.
+    This private primitive intentionally has no authorization semantics.  The
+    purge service is its sole caller and revalidates archived status and the
+    operation identity under the same ``BEGIN IMMEDIATE`` transaction.
     """
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row or row["status"] != "archived":
-            return False
-        conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
-        )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        return cur.rowcount == 1
+    conn.execute(
+        "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+        (task_id, task_id),
+    )
+    # Optional agent-stack tables are supported without becoming mandatory on
+    # stock Hermes boards.  Names come only from this explicit allowlist.
+    for table in (
+        "task_comments",
+        "task_events",
+        "task_runs",
+        "kanban_notify_subs",
+        "task_attachments",
+        "task_plans",
+        "task_checkpoints",
+    ):
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone():
+            conn.execute(f'DELETE FROM "{table}" WHERE task_id = ?', (task_id,))
+    cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    return cur.rowcount == 1
+
+
+def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Disabled compatibility shim; use the previewed purge service.
+
+    Immediate row deletion is intentionally unavailable even for archived
+    tasks because it bypasses confirmation, verified backup, filesystem/Git
+    inventory, durable audit, and resumable cleanup.
+    """
+    return False
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and cascade to all related rows.
-
-    Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
-    we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
-
-    Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
-    """
-    with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
-            return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-    recompute_ready(conn)
-    return True
+    """Disabled compatibility shim for the former unguarded hard delete."""
+    return False
 
 
 # ---------------------------------------------------------------------------

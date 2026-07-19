@@ -598,7 +598,8 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `block <id> "<reason>"` | Mark task blocked for human input. Also appends the reason as a comment. |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
 | `unblock <id>` | Return a blocked or scheduled task to ready (or `todo` if dependencies are still open). |
-| `archive <id>` | Hide from default list. `gc` will remove scratch workspaces. |
+| `archive <id>` | Hide from the default list. `archive --rm <id>` is a compatibility alias for a **single-task purge preview**; it no longer deletes immediately. |
+| `purge <id>` | Preview a backed-up hard purge of one already-archived task. Confirm with `--confirm` (hidden TTY prompt) or `--confirm-stdin`; repair interrupted cleanup with `purge --resume <operation-id>`. |
 | `tail <id>` | Follow a task's event stream. |
 | `dispatch` | One dispatcher pass on the active board. Flags: `--dry-run`, `--max N`, `--failure-limit N`, `--json`. |
 | `context <id>` | Print the full context a worker would see (title + body + parent results + comments). |
@@ -620,7 +621,25 @@ hermes kanban list                  # shows atm10-server tasks
 # Archive a board (recoverable) or hard-delete it.
 hermes kanban boards rm atm10-server
 hermes kanban boards rm atm10-server --delete
+
+# Purge one archived task: preview, then enter the shown one-time token.
+hermes kanban purge t_abcd1234
+hermes kanban purge t_abcd1234 --confirm
+# Automation may pipe exactly one token line; token values are never argv/env flags.
+printf '%s\n' "$TOKEN" | hermes kanban purge t_abcd1234 --confirm-stdin
+hermes kanban purge --resume kp_operation_id
 ```
+
+Task purge always creates and verifies an owner-only backup under the board
+storage directory's `purge-backups/<operation-id>/` before staging any owned
+resource. The live task rows, canonical attachments/logs, and safe managed
+scratch residue are removed only after confirmation. A `dir` workspace and the
+task branch are excluded because Hermes cannot prove exclusive ownership.
+
+This is logical live-store deletion, not secure physical erasure. The mandatory
+purge backup intentionally retains the content; SQLite free pages/WAL, Git
+objects, filesystem/provider snapshots, and other backups can also retain bytes
+until separate drained maintenance and retention work.
 
 Board resolution order (highest precedence first): `--board <slug>` flag → `HERMES_KANBAN_BOARD` env var → `~/.hermes/kanban/current` file → `default`.
 
