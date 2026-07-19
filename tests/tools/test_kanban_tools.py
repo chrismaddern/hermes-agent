@@ -180,6 +180,8 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "task" in d
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
+    assert isinstance(d["task"]["revision"], int)
+    assert d["task"]["revision"] >= 1
     assert "worker_context" in d
     assert "runs" in d
 
@@ -217,6 +219,7 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert ids == [a, c]
     assert d["count"] == 2
     assert d["tasks"][0]["title"] == "alpha"
+    assert isinstance(d["tasks"][0]["revision"], int)
     assert d["tasks"][0]["parent_count"] == 0
     assert b not in ids
 
