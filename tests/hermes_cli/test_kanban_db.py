@@ -4847,10 +4847,11 @@ def test_write_txn_healthy_commit_no_exception(tmp_path):
     conn.close()
 
 
-def test_write_txn_raises_on_truncated_file(tmp_path):
-    """A mocked smaller file size triggers the torn-extend check."""
+def test_write_txn_raises_on_truncated_file(tmp_path, monkeypatch):
+    """A mocked smaller rollback-journal file triggers the torn-extend check."""
     from hermes_cli.kanban_db import connect, write_txn
     db = tmp_path / "test.db"
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_MODE", "delete")
     conn = connect(db_path=db)
     # Get actual page size so we can fake a smaller file
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
@@ -4906,11 +4907,43 @@ def test_connect_sets_wal_autocheckpoint_100(tmp_path):
     conn.close()
 
 
-def test_write_txn_check_reads_correct_header_fields(tmp_path):
-    """Synthetic DB file with mismatched header page_count triggers the check."""
+def test_connect_honors_delete_journal_override(tmp_path, monkeypatch):
+    """Operators can force rollback journaling on WAL-unsafe persistent volumes."""
+    import hermes_cli.kanban_db as kanban_db_module
+
+    db = tmp_path / "delete-mode.db"
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_MODE", "delete")
+    kanban_db_module._INITIALIZED_PATHS.discard(str(db.resolve()))
+
+    conn = kanban_db_module.connect(db_path=db)
+
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    conn.close()
+
+
+def test_file_length_invariant_skips_wal_virtual_page_growth(tmp_path):
+    """WAL page_count may exceed the main file without a torn database extend."""
+    import hermes_cli.kanban_db as kanban_db_module
+
+    db = tmp_path / "wal-mode.db"
+    conn = kanban_db_module.connect(db_path=db)
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+    with unittest.mock.patch(
+        "hermes_cli.kanban_db.os.path.getsize",
+        return_value=0,
+    ):
+        kanban_db_module._check_file_length_invariant(conn)
+
+    conn.close()
+
+
+def test_write_txn_check_reads_correct_header_fields(tmp_path, monkeypatch):
+    """Synthetic rollback-journal DB with a short file triggers the check."""
     import struct
     from hermes_cli.kanban_db import connect, _check_file_length_invariant
     db = tmp_path / "synthetic.db"
+    monkeypatch.setenv("HERMES_KANBAN_JOURNAL_MODE", "delete")
     conn = connect(db_path=db)
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     conn.close()
