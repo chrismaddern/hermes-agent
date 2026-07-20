@@ -2045,6 +2045,41 @@ def repair_db(
         )
 
 
+def _apply_kanban_journal_mode(
+    conn: sqlite3.Connection,
+    *,
+    db_label: str,
+) -> str:
+    """Apply the operator-selected journal mode and return the active mode.
+
+    WAL is the default for local filesystems. Some persistent-volume backends
+    expose a normal-looking filesystem while failing to keep SQLite's shared
+    WAL index coherent across processes. Operators can force rollback
+    journaling there with ``HERMES_KANBAN_JOURNAL_MODE=delete``.
+    """
+    requested = os.environ.get("HERMES_KANBAN_JOURNAL_MODE", "wal").strip().lower()
+    if requested not in {"wal", "delete"}:
+        raise ValueError(
+            "HERMES_KANBAN_JOURNAL_MODE must be 'wal' or 'delete', "
+            f"got {requested!r}"
+        )
+    if requested == "wal":
+        from hermes_state import apply_wal_with_fallback
+
+        apply_wal_with_fallback(conn, db_label=db_label)
+    else:
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        actual = str(row[0]).lower() if row else ""
+        if actual != "delete":
+            raise sqlite3.OperationalError(
+                f"failed to enable DELETE journal mode for {db_label}: "
+                f"{actual or 'unknown'}"
+            )
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    return str(row[0]).lower() if row else requested
+
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -2090,10 +2125,12 @@ def connect(
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                journal_mode = _apply_kanban_journal_mode(
+                    conn, db_label=f"kanban.db ({path.name})"
+                )
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
+                if journal_mode == "wal":
+                    conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA cell_size_check=ON")
@@ -2122,12 +2159,14 @@ def connect(
                 # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
                 # falls back to DELETE with one WARNING so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                journal_mode = _apply_kanban_journal_mode(
+                    conn, db_label=f"kanban.db ({path.name})"
+                )
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")
-                conn.execute("PRAGMA wal_autocheckpoint=100")
+                if journal_mode == "wal":
+                    conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
                 # Zero freed pages so a later torn write cannot expose stale
                 # cell content; persisted in the DB header for new DBs.
@@ -2647,10 +2686,12 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
-    """Read the SQLite header page_count and compare against actual file size.
+    """Compare rollback-journal databases' header page count to file length.
 
     Raises sqlite3.DatabaseError if the file is shorter than the header claims
-    (torn-extend corruption).
+    (torn-extend corruption). WAL mode is intentionally excluded: its logical
+    page count may include pages that exist only in the WAL until checkpoint,
+    so comparing that value to the main file length produces false positives.
     """
     try:
         row = conn.execute("PRAGMA database_list").fetchone()
@@ -2660,14 +2701,20 @@ def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
         if not path_str:
             return  # in-memory or unnamed DB; skip
         path = path_str
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
         file_size = os.path.getsize(path)
         with open(path, "rb") as f:
-            f.seek(28)
-            header_bytes = f.read(4)
-        if len(header_bytes) < 4:
+            header = f.read(32)
+        if len(header) < 32:
             return  # can't read header; skip
-        header_page_count = int.from_bytes(header_bytes, "big")
+        # Header bytes 18 and 19 are the write/read format versions. A value
+        # of 2 means WAL, where logical pages can live only in the sidecar.
+        if header[18] == 2 or header[19] == 2:
+            return
+        raw_page_size = int.from_bytes(header[16:18], "big")
+        page_size = 65536 if raw_page_size == 1 else raw_page_size
+        if page_size <= 0:
+            return
+        header_page_count = int.from_bytes(header[28:32], "big")
         if header_page_count == 0:
             return  # new/empty DB; skip
         actual_pages = file_size // page_size
