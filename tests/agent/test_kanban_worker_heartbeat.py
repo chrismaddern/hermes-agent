@@ -12,6 +12,7 @@ import pytest
 
 from agent.kanban_worker_heartbeat import (
     KanbanWorkerHeartbeat,
+    enforce_current_run_ownership,
     worker_heartbeat_keepalive,
 )
 from hermes_cli import kanban_db as kb
@@ -166,6 +167,42 @@ def test_real_keepalive_refreshes_claim_and_prevents_stale_reclaim(
             assert task.status == "running"
 
 
+def test_stale_direct_worker_is_signalled_before_another_tool(running_worker):
+    task_id = running_worker
+    current_signals: list[str] = []
+    assert enforce_current_run_ownership(terminate_fn=current_signals.append) is None
+    assert current_signals == []
+
+    with kb.connect() as conn:
+        original = kb.get_task(conn, task_id)
+        assert original is not None
+        old_run_id = original.current_run_id
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                (task_id,),
+            )
+            kb._end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+            )
+        replacement = kb.claim_task(conn, task_id, claimer=kb._claimer_id())
+        assert replacement is not None
+        assert replacement.current_run_id != old_run_id
+        kb._set_worker_pid(conn, task_id, os.getpid() + 1000)
+
+    signals: list[str] = []
+    reason = enforce_current_run_ownership(terminate_fn=signals.append)
+
+    assert reason is not None
+    assert "stale kanban run fenced" in reason
+    assert f"expected_run={old_run_id}" in reason
+    assert signals == [reason]
+
+
 @pytest.mark.parametrize("final_status", ["blocked", "done"])
 def test_real_keepalive_self_stops_after_task_finalization(
     running_worker, final_status
@@ -180,3 +217,90 @@ def test_real_keepalive_self_stops_after_task_finalization(
             )
             conn.commit()
         assert _wait_until(lambda: not keepalive.is_alive)
+
+
+def test_concurrent_inline_tool_is_fenced_before_mutating_session_state(monkeypatch):
+    """Agent-loop tools must not bypass the stale-worker fence."""
+    from agent import agent_runtime_helpers as runtime
+    from tools.todo_tool import TodoStore
+
+    monkeypatch.setattr(
+        runtime,
+        "enforce_current_run_ownership",
+        lambda _tool_name: "stale kanban run fenced before todo",
+        raising=False,
+    )
+    store = TodoStore()
+    agent = SimpleNamespace(
+        _todo_store=store,
+        _memory_manager=None,
+        session_id="",
+        valid_tool_names={"todo"},
+        _current_turn_id="",
+        _current_api_request_id="",
+    )
+
+    result = runtime.invoke_tool(
+        agent,
+        "todo",
+        {
+            "todos": [
+                {
+                    "id": "stale-write",
+                    "content": "must not execute",
+                    "status": "pending",
+                }
+            ]
+        },
+        "t-stale",
+        pre_tool_block_checked=True,
+        skip_tool_request_middleware=True,
+    )
+
+    assert "STALE_WORKER" in result
+    assert store.has_items() is False
+
+
+def test_sequential_tool_is_fenced_before_request_middleware(monkeypatch):
+    """No stale call may reach middleware, hooks, guardrails, or execution."""
+    from agent import tool_executor
+
+    monkeypatch.setattr(tool_executor, "_budget_for_agent", lambda _agent: None)
+    monkeypatch.setattr(
+        tool_executor,
+        "enforce_current_run_ownership",
+        lambda _tool_name: "stale kanban run fenced before todo",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        tool_executor,
+        "_apply_tool_request_middleware_for_agent",
+        lambda *_args, **_kwargs: pytest.fail(
+            "stale worker reached tool request middleware"
+        ),
+    )
+    monkeypatch.setattr(
+        tool_executor,
+        "_flush_session_db_after_tool_progress",
+        lambda *_args, **_kwargs: pytest.fail(
+            "stale worker persisted a normal session checkpoint"
+        ),
+    )
+    tool_call = SimpleNamespace(
+        id="call-stale",
+        function=SimpleNamespace(name="todo", arguments="{}"),
+    )
+    assistant_message = SimpleNamespace(tool_calls=[tool_call])
+    messages = []
+    agent = SimpleNamespace(_interrupt_requested=False)
+
+    tool_executor.execute_tool_calls_sequential(
+        agent,
+        assistant_message,
+        messages,
+        "t-stale",
+        finalize=False,
+    )
+
+    assert len(messages) == 1
+    assert "STALE_WORKER" in messages[0]["content"]

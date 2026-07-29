@@ -262,18 +262,40 @@ def heartbeat_current_worker_from_env() -> bool:
         kb, conn = _connect()
         try:
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
             run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
             run_id: Optional[int]
             try:
                 run_id = int(run_id_raw) if run_id_raw else None
             except (TypeError, ValueError):
                 run_id = None
+            # Automatic worker heartbeats are ownership writes, not harmless
+            # telemetry. Never fall back to task/claimer-only matching: a
+            # delayed process can otherwise renew a replacement run that reused
+            # the same dispatcher claim token.
+            if run_id is None or not claim_lock:
+                return False
+            worker_pid = os.getpid()
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                if not kb.heartbeat_claim(
+                    conn,
+                    tid,
+                    claimer=claim_lock,
+                    expected_run_id=run_id,
+                    expected_worker_pid=worker_pid,
+                ):
+                    return False
+            except Exception:
+                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
+                return False
+            try:
+                kb.heartbeat_worker(
+                    conn,
+                    tid,
+                    note=None,
+                    expected_run_id=run_id,
+                    expected_claim_lock=claim_lock,
+                    expected_worker_pid=worker_pid,
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:
@@ -786,15 +808,25 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             # default _claimer_id() covers locally-driven workers that
             # never went through the dispatcher path.
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+            expected_run_id = _worker_run_id(tid)
+            expected_worker_pid = os.getpid() if expected_run_id is not None else None
+            claim_ok = kb.heartbeat_claim(
+                conn,
+                tid,
+                claimer=claim_lock,
+                expected_run_id=expected_run_id,
+                expected_worker_pid=expected_worker_pid,
+            )
 
             ok = kb.heartbeat_worker(
                 conn,
                 tid,
                 note=note,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=expected_run_id,
+                expected_claim_lock=(claim_lock if expected_run_id is not None else None),
+                expected_worker_pid=expected_worker_pid,
             )
-            if not ok:
+            if not claim_ok or not ok:
                 return tool_error(
                     f"could not heartbeat {tid} (unknown id or not running)"
                 )

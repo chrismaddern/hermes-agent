@@ -426,7 +426,6 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
 
 
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):
-    import signal
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -450,7 +449,9 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
         assert kb.get_task(conn, t).status == "ready"
-        assert killed == [signal.SIGTERM]
+        # The synthetic worker is already observably absent, so reclaim does
+        # not send a redundant signal before recording verified exit.
+        assert killed == []
 
 
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
@@ -1333,6 +1334,55 @@ def test_heartbeat_uses_env_default_ttl(kanban_home, monkeypatch):
         new = kb.get_task(conn, t).claim_expires
         assert new is not None
         assert new > int(time.time()) + 3000
+
+
+def test_stale_heartbeat_cannot_renew_replacement_with_reused_claimer(kanban_home):
+    """Run/PID fencing prevents the split heartbeat replacement race."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="heartbeat race", assignee="a")
+        claimer = "host:reused"
+        old = kb.claim_task(conn, task_id, claimer=claimer, ttl_seconds=60)
+        assert old is not None
+        old_run_id = old.current_run_id
+        assert old_run_id is not None
+        assert kb._set_worker_pid(conn, task_id, 42001)
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                (task_id,),
+            )
+            kb._end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+            )
+
+        replacement = kb.claim_task(
+            conn,
+            task_id,
+            claimer=claimer,
+            ttl_seconds=60,
+        )
+        assert replacement is not None
+        assert replacement.current_run_id != old_run_id
+        assert kb._set_worker_pid(conn, task_id, 42002)
+        replacement_expires = kb.get_task(conn, task_id).claim_expires
+
+        assert not kb.heartbeat_claim(
+            conn,
+            task_id,
+            claimer=claimer,
+            ttl_seconds=3600,
+            expected_run_id=old_run_id,
+            expected_worker_pid=42001,
+        )
+        current = kb.get_task(conn, task_id)
+        assert current.current_run_id == replacement.current_run_id
+        assert current.worker_pid == 42002
+        assert current.claim_expires == replacement_expires
 
 
 def test_concurrent_claims_only_one_wins(kanban_home):
@@ -2503,11 +2553,18 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         assert first_task.workspace_path == str(expected)
         assert first_task.branch_name == f"wt/{tid}"
 
-        conn.execute(
-            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
-            (tid,),
-        )
-        conn.commit()
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (tid,),
+            )
+            kb._end_run(
+                conn,
+                tid,
+                outcome="reclaimed",
+                status="reclaimed",
+            )
 
         second = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
         second_task = kb.get_task(conn, tid)

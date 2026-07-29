@@ -268,3 +268,70 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_quiet_kanban_timeout_exits_with_supervisor_sentinel(monkeypatch):
+    calls = []
+
+    import cli as cli_mod
+    from hermes_cli.kanban_db import KANBAN_TIMEOUT_EXIT_CODE
+
+    def run_conversation(*, user_message, conversation_history):
+        calls.append(("run", user_message, conversation_history))
+        return {
+            "final_response": "Iteration budget exhausted.",
+            "failed": False,
+            "kanban_exit_outcome": "timed_out",
+            "kanban_exit_metadata": {"budget_used": 250, "budget_max": 250},
+        }
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.provider = "test-provider"
+            self.model = "test-model"
+            self.session_id = "timeout-session"
+            self.conversation_history = []
+            self._active_agent_route_signature = "same-route"
+            self.agent = SimpleNamespace(
+                session_id="timeout-session",
+                platform="cli",
+                quiet_mode=False,
+                suppress_status_output=False,
+                stream_delta_callback=object(),
+                tool_gen_callback=object(),
+                run_conversation=run_conversation,
+            )
+
+        def _claim_active_session(self, surface, *, stderr=False):
+            calls.append(("claim", surface, stderr))
+            return True
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, effective_query):
+            return {
+                "signature": "same-route",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            return True
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_timeout")
+    monkeypatch.delenv("HERMES_KANBAN_GOAL_MODE", raising=False)
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cli_mod,
+        "_finalize_single_query",
+        lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="work kanban task t_timeout", quiet=True, toolsets="kanban")
+
+    assert exc_info.value.code == KANBAN_TIMEOUT_EXIT_CODE
+    assert calls[-1] == ("finalize", "timeout-session")

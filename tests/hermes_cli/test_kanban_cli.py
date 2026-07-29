@@ -382,7 +382,8 @@ def test_run_slash_reclaim_running_task(kanban_home):
     # Simulate a running claim outside TTL.
     conn = kb.connect()
     try:
-        lock = secrets.token_hex(4)
+        host = kb._claimer_id().split(":", 1)[0]
+        lock = f"{host}:{secrets.token_hex(4)}"
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
@@ -419,7 +420,8 @@ def test_run_slash_reassign_with_reclaim_flag(kanban_home):
     # Simulate a running claim.
     conn = kb.connect()
     try:
-        lock = secrets.token_hex(4)
+        host = kb._claimer_id().split(":", 1)[0]
+        lock = f"{host}:{secrets.token_hex(4)}"
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",

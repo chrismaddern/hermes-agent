@@ -267,13 +267,17 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_response_records_kanban_timeout(monkeypatch):
+def test_pending_response_requests_supervised_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "17")
     record = MagicMock(name="record_task_failure")
-    conn = SimpleNamespace(close=lambda: None)
-    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
     monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    connect_closing = MagicMock(name="connect_closing")
+    connection = connect_closing.return_value.__enter__.return_value
+    request_stop = MagicMock(name="request_worker_stop", return_value=True)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect_closing", connect_closing)
+    monkeypatch.setattr("hermes_cli.kanban_db.request_worker_stop", request_stop)
     agent = _LimitAgent()
 
     result = _finalize(
@@ -284,17 +288,22 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
-    record.assert_called_once_with(
-        conn,
+    assert result["kanban_exit_outcome"] == "timed_out"
+    assert result["kanban_exit_metadata"] == {
+        "budget_used": 60,
+        "budget_max": 60,
+    }
+    # The worker cannot both release its own claim and prove its process group
+    # has exited.  The dispatcher owns the terminal transition after observing
+    # the timeout sentinel exit.
+    record.assert_not_called()
+    request_stop.assert_called_once_with(
+        connection,
         "task-123",
-        error=(
-            "Iteration budget exhausted (60/60) — task could not complete "
-            "within the allowed iterations"
-        ),
+        expected_run_id=17,
         outcome="timed_out",
-        release_claim=True,
-        end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        error="iteration budget exhausted (60/60)",
+        metadata={"budget_used": 60, "budget_max": 60},
     )
 
 

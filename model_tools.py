@@ -1098,6 +1098,30 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    # Dispatcher workers are fenced by their exact run id before *every* tool
+    # dispatch.  A reclaimed worker must never reach terminal/file/browser or
+    # workflow tools after a replacement run owns the card.  The ownership
+    # helper sends SIGKILL to a confirmed-stale process group; an unavailable
+    # board fails closed for this call without killing a potentially-current
+    # worker.
+    try:
+        from agent.kanban_worker_heartbeat import enforce_current_run_ownership
+
+        ownership_error = enforce_current_run_ownership()
+    except Exception as exc:
+        ownership_error = (
+            "kanban run ownership check failed; tool dispatch fenced: "
+            f"{type(exc).__name__}"
+        )
+    if ownership_error:
+        return json.dumps(
+            {
+                "error": ownership_error,
+                "stale_kanban_run": True,
+                "tool_not_dispatched": function_name,
+            }
+        )
+
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every

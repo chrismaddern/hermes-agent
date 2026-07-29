@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from agent.kanban_worker_heartbeat import enforce_current_run_ownership
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -2355,6 +2356,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     """
     if not isinstance(function_args, dict):
         function_args = {}
+
+    # The sequential/concurrent batch executors both check before middleware,
+    # but keep a per-invocation fence here as well: ownership can change after
+    # batch preflight and agent-loop tools (todo, memory, delegate_task, etc.)
+    # execute inline instead of passing through model_tools.handle_function_call.
+    worker_fence_error = enforce_current_run_ownership(function_name)
+    if worker_fence_error is not None:
+        return json.dumps(
+            {"error": worker_fence_error, "code": "STALE_WORKER"},
+            ensure_ascii=False,
+        )
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:

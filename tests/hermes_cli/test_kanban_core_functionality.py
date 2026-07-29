@@ -948,10 +948,10 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
-    import hermes_cli.kanban_db as _kb
-    original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
+    # Patch the same module reference whose function is called below. Some
+    # cross-platform tests reload kanban_db during a full-suite run.
+    original_alive = kb._pid_alive
+    kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
 
     try:
         conn = kb.connect()
@@ -979,7 +979,9 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
 
             timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
             assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
+            # The liveness probe already verified this synthetic PID absent,
+            # so no signal is needed before the fenced transition.
+            assert killed == []
 
             task = kb.get_task(conn, tid)
             assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
@@ -994,14 +996,13 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
         finally:
             conn.close()
     finally:
-        _kb._pid_alive = original_alive
+        kb._pid_alive = original_alive
 
 
 def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
     """Two timed_out outcomes on the same task/profile trip the retry guard."""
-    import hermes_cli.kanban_db as _kb
-    original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False
+    original_alive = kb._pid_alive
+    kb._pid_alive = lambda pid: False
 
     def _age_active_run(conn, tid):
         old_started = int(time.time()) - 30
@@ -1036,7 +1037,7 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
         finally:
             conn.close()
     finally:
-        _kb._pid_alive = original_alive
+        kb._pid_alive = original_alive
 
 
 def test_max_runtime_none_means_no_cap(kanban_home):
@@ -1086,7 +1087,7 @@ def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
         import signal as _sig
         if sig == _sig.SIGTERM:
             state["sent_term"] = True
-    monkeypatch.setattr(_kb, "_pid_alive", _alive)
+    monkeypatch.setattr(kb, "_pid_alive", _alive)
 
     conn = kb.connect()
     try:
@@ -1231,7 +1232,12 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         events = kb.list_events(conn, tid)
         spawned = [e for e in events if e.kind == "spawned"]
         assert len(spawned) == 1
-        assert spawned[0].payload == {"pid": 98765}
+        assert spawned[0].payload == {
+            "pid": 98765,
+            "process_group_id": 98765,
+            "run_id": 1,
+            "signal_scope": "process_group",
+        }
     finally:
         conn.close()
 
@@ -2222,10 +2228,8 @@ def test_unseen_events_for_sub_includes_run_id(kanban_home):
         conn.close()
 
 
-def test_claim_task_recovers_from_invariant_leak(kanban_home):
-    """Belt-and-suspenders: if a prior run somehow leaked (stranded
-    current_run_id on a ready task), claim_task should recover rather
-    than strand it further."""
+def test_claim_task_refuses_invariant_leak_until_supervised_reclaim(kanban_home):
+    """A ready-looking task with an open run stays fenced from replacement."""
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="invariant test", assignee="worker")
@@ -2242,16 +2246,13 @@ def test_claim_task_recovers_from_invariant_leak(kanban_home):
         # The leaked run is still open.
         assert kb.get_run(conn, leaked_run_id).ended_at is None
 
-        # Now re-claim — the defensive recovery must close the leak.
+        # Re-claim must not silently close a potentially-live prior run. The
+        # dispatcher/operator reclaim path terminates and verifies it first.
         claimed = kb.claim_task(conn, tid)
-        assert claimed is not None
+        assert claimed is None
         leaked = kb.get_run(conn, leaked_run_id)
-        assert leaked.ended_at is not None
-        assert leaked.outcome == "reclaimed"
-        # New run opened and pointed to.
-        new_run = kb.latest_run(conn, tid)
-        assert new_run.id != leaked_run_id
-        assert new_run.ended_at is None
+        assert leaked.ended_at is None
+        assert kb.latest_run(conn, tid).id == leaked_run_id
     finally:
         conn.close()
 
@@ -4133,7 +4134,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
             if sig == signal.SIGTERM:
                 state["alive"] = False
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: state["alive"])
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
             "worker_pid=? WHERE id=?",
@@ -4220,7 +4221,8 @@ def test_reassign_task_with_reclaim_first_switches_profile(kanban_home):
     conn = kb.connect()
     try:
         t = kb.create_task(conn, title="switch me", assignee="orig")
-        lock = secrets.token_hex(8)
+        host = kb._claimer_id().split(":", 1)[0]
+        lock = f"{host}:{secrets.token_hex(8)}"
         future = int(time.time()) + 3600
         conn.execute(
             "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
@@ -4267,7 +4269,7 @@ def test_enforce_max_runtime_increments_consecutive_failures(kanban_home, monkey
         import signal as _sig
         if sig == _sig.SIGTERM:
             state["sent_term"] = True
-    monkeypatch.setattr(_kb, "_pid_alive", _alive)
+    monkeypatch.setattr(kb, "_pid_alive", _alive)
 
     conn = kb.connect()
     try:
@@ -4320,7 +4322,7 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         import signal as _sig
         if sig == _sig.SIGTERM:
             state["sent_term"] = True
-    monkeypatch.setattr(_kb, "_pid_alive", _alive)
+    monkeypatch.setattr(kb, "_pid_alive", _alive)
 
     conn = kb.connect()
     try:
@@ -4695,7 +4697,8 @@ def test_reclaim_task_clears_failure_counter(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="stuck", assignee="worker")
-        lock = secrets.token_hex(4)
+        host = kb._claimer_id().split(":", 1)[0]
+        lock = f"{host}:{secrets.token_hex(4)}"
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status='running', claim_lock=?, "

@@ -15666,7 +15666,13 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     import os as _os
 
     task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    if not task_id:
+    raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        expected_run_id = int(raw_run_id) if raw_run_id else None
+    except ValueError:
+        logger.warning("kanban goal loop refusing invalid run id %r", raw_run_id)
+        return
+    if not task_id or expected_run_id is None:
         return
 
     from hermes_cli import kanban_db as _kb
@@ -15683,6 +15689,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         except Exception:
             pass
     if task is None:
+        return
+    if expected_run_id is not None and task.current_run_id != expected_run_id:
+        logger.warning(
+            "kanban goal loop refusing stale run for %s: expected %s, current %s",
+            task_id, expected_run_id, task.current_run_id,
+        )
         return
 
     goal_parts = [task.title or ""]
@@ -15714,7 +15726,18 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         c = _kb.connect()
         try:
             t = _kb.get_task(c, task_id)
-            return t.status if t is not None else None
+            if t is None:
+                return None
+            if expected_run_id is not None and t.current_run_id != expected_run_id:
+                return "replaced"
+            if expected_run_id is not None:
+                run = c.execute(
+                    "SELECT status FROM task_runs WHERE id = ? AND task_id = ?",
+                    (expected_run_id, task_id),
+                ).fetchone()
+                if run is not None and run["status"] == "stopping":
+                    return "stopping"
+            return t.status
         finally:
             try:
                 c.close()
@@ -15724,7 +15747,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     def _block(reason: str) -> None:
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            _kb.block_task(
+                c,
+                task_id,
+                reason=reason,
+                expected_run_id=expected_run_id,
+            )
         finally:
             try:
                 c.close()
@@ -16191,7 +16219,14 @@ def main(
                         # out (→ sticky block). Gated on the env vars the
                         # dispatcher sets in `_default_spawn`; a no-op for every
                         # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+                        _kanban_timeout_requested = bool(
+                            isinstance(result, dict)
+                            and result.get("kanban_exit_outcome") == "timed_out"
+                        )
+                        if (
+                            os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+                            and not _kanban_timeout_requested
+                        ):
                             try:
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
@@ -16213,7 +16248,18 @@ def main(
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
                         _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
+                        if (
+                            _kanban_timeout_requested
+                            and os.environ.get("HERMES_KANBAN_TASK")
+                        ):
+                            try:
+                                from hermes_cli.kanban_db import (
+                                    KANBAN_TIMEOUT_EXIT_CODE as _TIMEOUT_CODE,
+                                )
+                                _exit_code = _TIMEOUT_CODE
+                            except Exception:
+                                _exit_code = 1
+                        elif isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
                             if os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"

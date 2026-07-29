@@ -31,6 +31,7 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.kanban_worker_heartbeat import enforce_current_run_ownership
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
@@ -89,6 +90,28 @@ def _budget_for_agent(agent) -> BudgetConfig:
         return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
     except Exception:
         return DEFAULT_BUDGET
+
+
+def _worker_fence_result(function_name: str) -> Optional[str]:
+    """Return a terminal stale-worker tool result, or ``None`` when current."""
+    worker_fence_error = enforce_current_run_ownership(function_name)
+    if worker_fence_error is None:
+        return None
+    return json.dumps(
+        {"error": worker_fence_error, "code": "STALE_WORKER"},
+        ensure_ascii=False,
+    )
+
+
+def _is_worker_fence_result(result: Any) -> bool:
+    """Recognize the terminal fence result without persisting worker progress."""
+    if not isinstance(result, str):
+        return False
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("code") == "STALE_WORKER"
 
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
@@ -362,6 +385,23 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
+
+    # Fence before request middleware, plugin hooks, checkpoints, or inline
+    # agent tools can mutate state. A second check in ``invoke_tool`` closes
+    # the race where ownership changes after this batch-level preflight.
+    if tool_calls:
+        worker_fence_result = _worker_fence_result(tool_calls[0].function.name)
+        if worker_fence_result is not None:
+            for tool_call in tool_calls:
+                messages.append(
+                    make_tool_result_message(
+                        tool_call.function.name,
+                        worker_fence_result,
+                        tool_call.id,
+                        effect_disposition="none",
+                    )
+                )
+            return
 
     # ── Pre-flight: interrupt check ──────────────────────────────────
     if agent._interrupt_requested:
@@ -909,6 +949,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = 0.0
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
+            if _is_worker_fence_result(function_result):
+                messages.append(
+                    make_tool_result_message(
+                        function_name,
+                        function_result,
+                        tc.id,
+                        effect_disposition="none",
+                    )
+                )
+                continue
             if blocked:
                 effect_disposition = "none"
 
@@ -1082,6 +1132,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             break
 
         function_name = tool_call.function.name
+
+        # The model_tools registry has its own defense-in-depth fence, but
+        # agent-loop tools execute inline in this function. Check before even
+        # parsing middleware-visible arguments so no stale call reaches hooks,
+        # guardrails, checkpoints, or a side-effecting handler.
+        worker_fence_result = _worker_fence_result(function_name)
+        if worker_fence_result is not None:
+            messages.append(
+                make_tool_result_message(
+                    function_name,
+                    worker_fence_result,
+                    tool_call.id,
+                    effect_disposition="none",
+                )
+            )
+            continue
 
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
@@ -1581,6 +1647,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
+
+        if _is_worker_fence_result(function_result):
+            messages.append(
+                make_tool_result_message(
+                    function_name,
+                    function_result,
+                    tool_call.id,
+                    effect_disposition="none",
+                )
+            )
+            continue
 
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (

@@ -233,6 +233,12 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Iteration-limited workers exit with a sentinel instead of releasing their
+# own claim.  The dispatcher can then prove the worker process group is gone
+# before it records ``timed_out`` and exposes the task for replacement.  124
+# follows GNU ``timeout`` convention and is distinct from ordinary CLI exits.
+KANBAN_TIMEOUT_EXIT_CODE = 124
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -3965,6 +3971,24 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    existing_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    existing_metadata: dict[str, Any] = {}
+    if existing_row is not None and existing_row["metadata"]:
+        try:
+            decoded = json.loads(existing_row["metadata"])
+            if isinstance(decoded, dict):
+                existing_metadata = decoded
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    if metadata:
+        existing_metadata.update(metadata)
+    metadata_json = (
+        json.dumps(existing_metadata, ensure_ascii=False)
+        if existing_metadata
+        else None
+    )
     conn.execute(
         """
         UPDATE task_runs
@@ -3975,8 +3999,7 @@ def _end_run(
                metadata      = ?,
                ended_at      = ?,
                claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
+               claim_expires = NULL
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -3985,7 +4008,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            metadata_json,
             now,
             run_id,
         ),
@@ -4132,12 +4155,21 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, "
+            "       current_run_id, claim_lock, worker_pid "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if (
+                row["current_run_id"] is not None
+                or row["claim_lock"] is not None
+                or row["worker_pid"] is not None
+            ):
+                # A terminal handoff is still waiting for the prior worker
+                # process group to exit. Never promote through that barrier.
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4228,26 +4260,33 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
-        # Defensive: if a prior run somehow leaked (invariant violation from
-        # an unknown code path), close it as 'reclaimed' so we don't strand
-        # it when the CAS resets the pointer below. No-op when the invariant
-        # holds (the common case).
+        # Fail closed if a prior run/worker lease leaked onto a ready row.  The
+        # old behavior silently closed that run here, making a replacement
+        # claimable without terminating or verifying the prior process group.
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
+            "SELECT current_run_id, worker_pid, claim_lock FROM tasks "
+            "WHERE id = ? AND status = 'ready'",
             (task_id,),
         ).fetchone()
-        if stale and stale["current_run_id"]:
-            conn.execute(
-                """
-                UPDATE task_runs
-                   SET status = 'reclaimed', outcome = 'reclaimed',
-                       summary = COALESCE(summary, 'invariant recovery on re-claim'),
-                       ended_at = ?,
-                       claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-                 WHERE id = ? AND ended_at IS NULL
-                """,
-                (now, int(stale["current_run_id"])),
+        if stale and any(
+            stale[field] is not None
+            for field in ("current_run_id", "worker_pid", "claim_lock")
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "prior_worker_not_terminal",
+                    "run_id": stale["current_run_id"],
+                    "pid": stale["worker_pid"],
+                    "process_group_id": (
+                        stale["worker_pid"] if os.name != "nt" else None
+                    ),
+                },
+                run_id=stale["current_run_id"],
             )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4258,6 +4297,8 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND current_run_id IS NULL
+               AND worker_pid IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -4342,6 +4383,8 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND current_run_id IS NULL
+               AND worker_pid IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -4390,6 +4433,8 @@ def heartbeat_claim(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    expected_worker_pid: Optional[int] = None,
 ) -> bool:
     """Extend a running claim.  Returns True if we still own it.
 
@@ -4399,16 +4444,33 @@ def heartbeat_claim(
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
-        cur = conn.execute(
+        sql = (
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
-            (expires, task_id, lock),
+            "WHERE id = ? AND status = 'running' AND claim_lock = ?"
         )
+        params: list[Any] = [expires, task_id, lock]
+        if expected_run_id is not None:
+            sql += (
+                " AND current_run_id = ? "
+                "AND EXISTS (SELECT 1 FROM task_runs r "
+                "WHERE r.id = tasks.current_run_id AND r.status = 'running' "
+                "AND r.ended_at IS NULL)"
+            )
+            params.append(int(expected_run_id))
+        if expected_worker_pid is not None:
+            sql += " AND worker_pid = ?"
+            params.append(int(expected_worker_pid))
+        cur = conn.execute(sql, tuple(params))
         if cur.rowcount == 1:
-            run_id = _current_run_id(conn, task_id)
+            run_id = (
+                int(expected_run_id)
+                if expected_run_id is not None
+                else _current_run_id(conn, task_id)
+            )
             if run_id is not None:
                 conn.execute(
-                    "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                    "UPDATE task_runs SET claim_expires = ? "
+                    "WHERE id = ? AND status = 'running' AND ended_at IS NULL",
                     (expires, run_id),
                 )
             return True
@@ -4450,7 +4512,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
+        "       current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -4525,7 +4588,12 @@ def release_stale_claims(
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            row["worker_pid"],
+            row["claim_lock"],
+            signal_fn=signal_fn,
+            task_id=row["id"],
+            expected_run_id=row["current_run_id"],
+            expected_db_path=_connection_db_path(conn),
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -4533,15 +4601,24 @@ def release_stale_claims(
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
+                expected_run_id=row["current_run_id"],
+                expected_worker_pid=row["worker_pid"],
             )
             continue
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "WHERE id = ? AND status = 'running' "
+                "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (
+                    row["id"],
+                    row["current_run_id"],
+                    row["worker_pid"],
+                    row["claim_lock"],
+                    now,
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -4549,7 +4626,20 @@ def release_stale_claims(
                 conn, row["id"],
                 outcome="reclaimed", status="reclaimed",
                 error=f"stale_lock={row['claim_lock']}",
-                metadata=termination,
+                metadata={
+                    **termination,
+                    "run_id": row["current_run_id"],
+                    "pid": row["worker_pid"],
+                    "process_group_id": (
+                        row["worker_pid"]
+                        if row["worker_pid"] is not None and os.name != "nt"
+                        else None
+                    ),
+                    "terminal_outcome": "reclaimed",
+                    "process_group_exit_verified": bool(
+                        row["worker_pid"] is None or termination.get("terminated")
+                    ),
+                },
             )
             payload = {
                 "stale_lock": row["claim_lock"],
@@ -4595,7 +4685,8 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -4605,15 +4696,38 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        row["worker_pid"],
+        prev_lock,
+        signal_fn=signal_fn,
+        task_id=task_id,
+        expected_run_id=row["current_run_id"],
+        expected_db_path=_connection_db_path(conn),
     )
+    if row["worker_pid"] is not None and not termination.get("terminated"):
+        if row["status"] == "running" and prev_lock is not None:
+            _defer_reclaim_for_live_worker(
+                conn,
+                task_id,
+                prev_lock,
+                int(time.time()),
+                termination,
+                reason="manual_reclaim_process_group_alive",
+                expected_run_id=row["current_run_id"],
+                expected_worker_pid=row["worker_pid"],
+            )
+        return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            "AND current_run_id IS ? AND worker_pid IS ? AND claim_lock IS ?",
+            (
+                task_id,
+                row["current_run_id"],
+                row["worker_pid"],
+                prev_lock,
+            ),
         )
         if cur.rowcount != 1:
             return False
@@ -4624,7 +4738,20 @@ def reclaim_task(
                 f"manual_reclaim: {reason}" if reason
                 else f"manual_reclaim lock={prev_lock}"
             ),
-            metadata=termination,
+            metadata={
+                **termination,
+                "run_id": row["current_run_id"],
+                "pid": row["worker_pid"],
+                "process_group_id": (
+                    row["worker_pid"]
+                    if row["worker_pid"] is not None and os.name != "nt"
+                    else None
+                ),
+                "terminal_outcome": "reclaimed",
+                "process_group_exit_verified": bool(
+                    row["worker_pid"] is None or termination.get("terminated")
+                ),
+            },
         )
         payload = {
             "manual": True,
@@ -4661,6 +4788,78 @@ def _claim_host_is_local(claim_lock: Optional[str]) -> bool:
     return bool(local_host) and claim_host == local_host
 
 
+def _orphaned_worker_group_identity_matches(
+    process_group_id: int,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    expected_claim_lock: str,
+    expected_db_path: str,
+    expected_board: Optional[str],
+) -> bool:
+    """Prove a dead leader's surviving group from inherited worker identity."""
+    if os.name == "nt" or sys.platform != "linux":
+        return False
+    try:
+        import psutil
+    except ImportError:
+        return False
+
+    expected_db = Path(expected_db_path).expanduser().resolve(strict=False)
+    matched_member = False
+    try:
+        for process in psutil.process_iter(["pid", "status"]):
+            member_pid = int(process.info["pid"])
+            try:
+                if os.getpgid(member_pid) != int(process_group_id):
+                    continue
+                if process.status() == psutil.STATUS_ZOMBIE:
+                    continue
+                environment = process.environ()
+            except psutil.NoSuchProcess:
+                continue
+            except (OSError, ValueError, psutil.Error):
+                # Once a process is known to be in the target group, missing
+                # identity evidence is not safe enough to signal it.
+                return False
+
+            identity_keys = (
+                "HERMES_KANBAN_TASK",
+                "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_CLAIM_LOCK",
+                "HERMES_KANBAN_DB",
+            )
+            if not any(environment.get(key) for key in identity_keys):
+                # Descendants may intentionally replace their environment;
+                # require at least one surviving member with the full identity.
+                continue
+            if environment.get("HERMES_KANBAN_TASK") != task_id:
+                return False
+            if environment.get("HERMES_KANBAN_RUN_ID") != str(expected_run_id):
+                return False
+            if environment.get("HERMES_KANBAN_CLAIM_LOCK") != expected_claim_lock:
+                return False
+            worker_db = environment.get("HERMES_KANBAN_DB", "")
+            if not worker_db or Path(worker_db).expanduser().resolve(
+                strict=False
+            ) != expected_db:
+                return False
+            if expected_board is not None:
+                try:
+                    worker_board = _normalize_board_slug(
+                        environment.get("HERMES_KANBAN_BOARD", "")
+                    )
+                    canonical_board = _normalize_board_slug(expected_board)
+                except ValueError:
+                    return False
+                if not worker_board or worker_board != canonical_board:
+                    return False
+            matched_member = True
+    except (OSError, ValueError, psutil.Error):
+        return False
+    return matched_member
+
+
 def _cancel_worker_identity_matches(
     pid: int,
     task_id: str,
@@ -4668,14 +4867,26 @@ def _cancel_worker_identity_matches(
     expected_run_id: int,
     expected_claim_lock: str,
     expected_db_path: str,
-    expected_board: str,
+    expected_board: Optional[str],
+    leader_alive: Optional[bool] = None,
 ) -> bool:
-    """Fail-closed proof that PID is this task's isolated Hermes worker."""
+    """Fail-closed proof that PID or its surviving group is this worker."""
     if not pid or pid <= 0:
         return False
+    if leader_alive is False:
+        return _orphaned_worker_group_identity_matches(
+            pid,
+            task_id,
+            expected_run_id=expected_run_id,
+            expected_claim_lock=expected_claim_lock,
+            expected_db_path=expected_db_path,
+            expected_board=expected_board,
+        )
     try:
         import psutil
-
+    except ImportError:
+        return False
+    try:
         process = psutil.Process(int(pid))
         environment = process.environ()
         if environment.get("HERMES_KANBAN_TASK") != task_id:
@@ -4689,15 +4900,16 @@ def _cancel_worker_identity_matches(
             expected_db_path
         ).expanduser().resolve(strict=False):
             return False
-        try:
-            worker_board = _normalize_board_slug(
-                environment.get("HERMES_KANBAN_BOARD", "")
-            )
-            canonical_board = _normalize_board_slug(expected_board)
-        except ValueError:
-            return False
-        if not worker_board or worker_board != canonical_board:
-            return False
+        if expected_board is not None:
+            try:
+                worker_board = _normalize_board_slug(
+                    environment.get("HERMES_KANBAN_BOARD", "")
+                )
+                canonical_board = _normalize_board_slug(expected_board)
+            except ValueError:
+                return False
+            if not worker_board or worker_board != canonical_board:
+                return False
         command = " ".join(process.cmdline())
         if task_id not in command or "work kanban task" not in command:
             return False
@@ -4706,8 +4918,26 @@ def _cancel_worker_identity_matches(
             # signal a shared or inherited process group.
             return False
         return True
+    except psutil.NoSuchProcess:
+        return _orphaned_worker_group_identity_matches(
+            pid,
+            task_id,
+            expected_run_id=expected_run_id,
+            expected_claim_lock=expected_claim_lock,
+            expected_db_path=expected_db_path,
+            expected_board=expected_board,
+        )
     except (OSError, ValueError, psutil.Error):
         return False
+
+
+def _connection_db_path(conn: sqlite3.Connection) -> str:
+    """Return the canonical main-database path for worker identity fencing."""
+    record = next(
+        row for row in conn.execute("PRAGMA database_list").fetchall()
+        if row[1] == "main"
+    )
+    return str(Path(record[2]).expanduser().resolve(strict=False))
 
 
 def _process_group_alive(pgid: int) -> bool:
@@ -4720,7 +4950,9 @@ def _process_group_alive(pgid: int) -> bool:
         # merely because waitpid has not run yet.
         proc_root = Path("/proc")
         try:
-            entries = proc_root.iterdir()
+            # ``Path.iterdir`` is lazy: permission/I/O failures can surface
+            # while advancing the iterator, not when it is constructed.
+            entries = list(proc_root.iterdir())
         except OSError:
             # Losing /proc visibility is not proof that the group exited.
             # Fall back to the kernel existence probe and fail closed on any
@@ -4766,7 +4998,9 @@ def _process_group_alive(pgid: int) -> bool:
         # We cannot prove it is gone.
         return True
     except OSError:
-        return False
+        # Only ESRCH (ProcessLookupError above) proves absence. EINVAL,
+        # EPERM-like platform errors, and inspection failures all fail closed.
+        return True
 
 
 def _terminate_cancel_worker_group(pid: int) -> Optional[str]:
@@ -4777,9 +5011,12 @@ def _terminate_cancel_worker_group(pid: int) -> Optional[str]:
     if os.name == "nt":
         if not _pid_alive(pid):
             return "already_stopped"
-        # Hermes's Windows process shim maps SIGTERM to TerminateProcess; the
-        # PID identity proof above still prevents signalling a recycled PID.
-        signal_target = lambda sig: os.kill(pid, sig)
+        # A plain os.kill only terminates the leader on Windows.  Use Hermes's
+        # taskkill /T /F wrapper so descendants cannot survive beside a
+        # replacement claim.  The caller already proved this worker identity.
+        from gateway.status import terminate_pid
+
+        signal_target = lambda _sig: terminate_pid(pid, force=True)
         alive = lambda: _pid_alive(pid)
     else:
         # The tracked leader can exit while descendants remain in its process
@@ -6068,7 +6305,8 @@ def block_task(
     recurrences = 0
     with _command_transaction(conn, transaction_owned):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences, revision "
+            "SELECT status, block_kind, block_recurrences, revision, "
+            "       current_run_id, worker_pid, claim_lock "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6094,6 +6332,87 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # A dispatched worker cannot safely clear its own claim and move to
+            # ``todo``: with no remaining parents, recompute_ready can promote
+            # and claim a replacement before this process exits.  Install a
+            # run-scoped exit barrier instead.  The dispatcher finalizes the
+            # dependency wait only after the process group is verified gone.
+            if (
+                expected_run_id is not None
+                and cur_row["status"] == "running"
+                and cur_row["worker_pid"] is not None
+                and cur_row["current_run_id"] == int(expected_run_id)
+            ):
+                run_row = conn.execute(
+                    "SELECT status, metadata FROM task_runs "
+                    "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                    (int(expected_run_id), task_id),
+                ).fetchone()
+                if run_row is None or run_row["status"] != "running":
+                    return False
+                run_metadata: dict[str, Any] = {}
+                if run_row["metadata"]:
+                    try:
+                        decoded = json.loads(run_row["metadata"])
+                        if isinstance(decoded, dict):
+                            run_metadata = decoded
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                run_metadata["terminal_request"] = {
+                    "operation": "dependency_wait",
+                    "next_status": "todo",
+                    "kind": kind,
+                    "reason": reason,
+                }
+                run_cur = conn.execute(
+                    "UPDATE task_runs SET status = 'stopping', "
+                    "outcome = 'blocked', summary = ?, metadata = ? "
+                    "WHERE id = ? AND status = 'running' AND ended_at IS NULL",
+                    (
+                        reason,
+                        json.dumps(run_metadata, ensure_ascii=False),
+                        int(expected_run_id),
+                    ),
+                )
+                task_cur = conn.execute(
+                    "UPDATE tasks SET block_kind = ? "
+                    "WHERE id = ? AND status = 'running' "
+                    "AND current_run_id = ? AND worker_pid IS ? "
+                    "AND claim_lock IS ?",
+                    (
+                        kind,
+                        task_id,
+                        int(expected_run_id),
+                        cur_row["worker_pid"],
+                        cur_row["claim_lock"],
+                    ),
+                )
+                if run_cur.rowcount != 1 or task_cur.rowcount != 1:
+                    raise TaskCommandConflict(
+                        "run_changed",
+                        "the dependency-stop run or worker identity changed",
+                    )
+                _append_event(
+                    conn,
+                    task_id,
+                    "termination_requested",
+                    {
+                        "run_id": int(expected_run_id),
+                        "pid": int(cur_row["worker_pid"]),
+                        "process_group_id": (
+                            int(cur_row["worker_pid"])
+                            if os.name != "nt"
+                            else None
+                        ),
+                        "terminal_outcome": "blocked",
+                        "next_status": "todo",
+                        "reason": reason,
+                        "kind": kind,
+                    },
+                    run_id=int(expected_run_id),
+                )
+                return True
+
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -6143,6 +6462,91 @@ def block_task(
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
+
+        # Like dependency waits, a dispatched worker cannot safely release its
+        # own claim while its process group is still alive.  Keep the task in
+        # ``running`` and persist the eventual block destination as terminal
+        # intent; the supervisor applies it only after verifying group exit.
+        if (
+            expected_run_id is not None
+            and cur_row["status"] == "running"
+            and cur_row["worker_pid"] is not None
+            and cur_row["current_run_id"] == int(expected_run_id)
+        ):
+            next_status = (
+                "triage" if recurrences >= BLOCK_RECURRENCE_LIMIT else "blocked"
+            )
+            run_row = conn.execute(
+                "SELECT status, metadata FROM task_runs "
+                "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (int(expected_run_id), task_id),
+            ).fetchone()
+            if run_row is None or run_row["status"] != "running":
+                return False
+            run_metadata: dict[str, Any] = {}
+            if run_row["metadata"]:
+                try:
+                    decoded = json.loads(run_row["metadata"])
+                    if isinstance(decoded, dict):
+                        run_metadata = decoded
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            run_metadata["terminal_request"] = {
+                "operation": "block_wait",
+                "next_status": next_status,
+                "kind": kind,
+                "reason": reason,
+                "recurrences": recurrences,
+                "limit": BLOCK_RECURRENCE_LIMIT,
+            }
+            run_cur = conn.execute(
+                "UPDATE task_runs SET status = 'stopping', "
+                "outcome = 'blocked', summary = ?, metadata = ? "
+                "WHERE id = ? AND status = 'running' AND ended_at IS NULL",
+                (
+                    reason,
+                    json.dumps(run_metadata, ensure_ascii=False),
+                    int(expected_run_id),
+                ),
+            )
+            task_cur = conn.execute(
+                "UPDATE tasks SET block_kind = ?, block_recurrences = ? "
+                "WHERE id = ? AND status = 'running' "
+                "AND current_run_id = ? AND worker_pid IS ? "
+                "AND claim_lock IS ?",
+                (
+                    kind,
+                    recurrences,
+                    task_id,
+                    int(expected_run_id),
+                    cur_row["worker_pid"],
+                    cur_row["claim_lock"],
+                ),
+            )
+            if run_cur.rowcount != 1 or task_cur.rowcount != 1:
+                raise TaskCommandConflict(
+                    "run_changed",
+                    "the block-stop run or worker identity changed",
+                )
+            _append_event(
+                conn,
+                task_id,
+                "termination_requested",
+                {
+                    "run_id": int(expected_run_id),
+                    "pid": int(cur_row["worker_pid"]),
+                    "process_group_id": (
+                        int(cur_row["worker_pid"]) if os.name != "nt" else None
+                    ),
+                    "terminal_outcome": "blocked",
+                    "next_status": next_status,
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                },
+                run_id=int(expected_run_id),
+            )
+            return True
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
@@ -7344,6 +7748,9 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"timed_out"`` — ``WIFEXITED`` with
+      ``KANBAN_TIMEOUT_EXIT_CODE``. The worker exhausted its conversation
+      budget and deliberately left its claim intact for supervised handoff.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -7365,6 +7772,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_TIMEOUT_EXIT_CODE:
+                return ("timed_out", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -7465,34 +7874,107 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    task_id: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    expected_db_path: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Terminate and verify a host-local worker process group before reclaim.
+
+    Workers are spawned with ``start_new_session=True``, so the persisted
+    leader PID is also the process-group ID.  Killing only that leader can
+    leave tool descendants alive beside a replacement run.  Production POSIX
+    calls therefore target and verify the whole group.  ``signal_fn`` remains
+    a backwards-compatible single-PID test hook.
+    """
     import signal
 
     info: dict[str, Any] = {
+        "worker_pid": int(pid) if pid else None,
         "prev_pid": int(pid) if pid else None,
+        "process_group_id": int(pid) if pid and os.name != "nt" else None,
+        "signal_scope": (
+            "process_group" if pid and os.name != "nt" else "process_tree"
+        ),
         "host_local": False,
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "survived": False,
+        "identity_verified": False,
+        "identity_mismatch": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
 
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    if not str(claim_lock).startswith(host_prefix):
+    lock_text = str(claim_lock)
+    if not lock_text.startswith(host_prefix):
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
-    )
-    if kill is None:
-        return info
+    # Production signaling is fail-closed against PID reuse. When the leader
+    # is gone but descendants remain, identity proof scans that exact process
+    # group for the inherited task/run/claim/DB environment before signalling.
+    # Test hooks intentionally bypass psutil identity inspection.
+    if signal_fn is None:
+        leader_alive = _pid_alive(int(pid))
+        group_alive = (
+            leader_alive
+            if os.name == "nt"
+            else _process_group_alive(int(pid))
+        )
+        if not group_alive:
+            info["terminated"] = True
+            return info
+        if (
+            not task_id
+            or expected_run_id is None
+            or not expected_db_path
+            or not _cancel_worker_identity_matches(
+                int(pid),
+                task_id,
+                expected_run_id=int(expected_run_id),
+                expected_claim_lock=lock_text,
+                expected_db_path=expected_db_path,
+                expected_board=None,
+                leader_alive=leader_alive,
+            )
+        ):
+            info["identity_mismatch"] = True
+            info["survived"] = True
+            return info
+        info["identity_verified"] = True
+
+    if os.name != "nt" and signal_fn is None and hasattr(os, "killpg"):
+        alive = _process_group_alive
+
+        def send(sig: int) -> None:
+            os.killpg(int(pid), sig)  # windows-footgun: ok - POSIX branch
+    elif os.name == "nt" and signal_fn is None:
+        from gateway.status import terminate_pid
+
+        alive = _pid_alive
+
+        def send(_sig: int) -> None:
+            terminate_pid(int(pid), force=True)
+    else:
+        kill = signal_fn if signal_fn is not None else (
+            os.kill if hasattr(os, "kill") else None
+        )
+        if kill is None:
+            return info
+        alive = _pid_alive
+
+        def send(sig: int) -> None:
+            kill(int(pid), sig)
 
     info["termination_attempted"] = True
+    if not alive(int(pid)):
+        info["terminated"] = True
+        return info
+
     try:
-        kill(int(pid), signal.SIGTERM)
+        send(signal.SIGTERM)
     except ProcessLookupError:
         # Process is already gone — that's a successful termination, not a
         # survival. Leaving terminated=False here would make the reclaim guard
@@ -7502,23 +7984,31 @@ def _terminate_reclaimed_worker(
     except OSError:
         return info
 
-    for _ in range(10):
-        if not _pid_alive(pid):
+    for _ in range(50):
+        if not alive(int(pid)):
             info["terminated"] = True
             return info
-        time.sleep(0.5)
+        time.sleep(0.1)
 
-    if _pid_alive(pid):
+    if alive(int(pid)):
         try:
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
             _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
+            send(_sigkill)
             info["sigkill"] = True
         except (ProcessLookupError, OSError):
             return info
 
-    info["terminated"] = not _pid_alive(pid)
+    # Signal delivery is not proof of exit.  Hold the claim until the full
+    # process group is observably gone.
+    for _ in range(40):
+        if not alive(int(pid)):
+            info["terminated"] = True
+            return info
+        time.sleep(0.05)
+    info["terminated"] = not alive(int(pid))
+    info["survived"] = not info["terminated"]
     return info
 
 
@@ -7527,13 +8017,17 @@ def _worker_survived_termination(termination: dict) -> bool:
 
     Reclaiming in this state would release the claim and let the dispatcher
     spawn a second worker while the first is still running — the duplication
-    loop. Only host-local workers we actually signalled count: a non-local
-    claim lock or a no-op attempt (no ``os.kill`` available) must fall through
-    to the normal release path, since we cannot manage that worker anyway.
+    loop. Only host-local worker identities count: a non-local claim lock falls
+    through to the foreign-host recovery policy. A host-local
+    PID with an unverified identity or unavailable signal primitive remains
+    fenced just like a process that survived SIGKILL.
     """
     return bool(
-        termination.get("termination_attempted")
-        and termination.get("host_local")
+        termination.get("host_local")
+        and (
+            termination.get("termination_attempted")
+            or termination.get("worker_pid")
+        )
         and not termination.get("terminated")
     )
 
@@ -7546,6 +8040,8 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
+    expected_run_id: Optional[int] = None,
+    expected_worker_pid: Optional[int] = None,
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
@@ -7557,14 +8053,25 @@ def _defer_reclaim_for_live_worker(
     """
     grace = now + RECLAIM_DEFER_GRACE_SECONDS
     with write_txn(conn):
-        cur = conn.execute(
+        sql = (
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
-            (grace, task_id, claim_lock),
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?"
         )
+        params: list[Any] = [grace, task_id, claim_lock]
+        if expected_run_id is not None:
+            sql += " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        if expected_worker_pid is not None:
+            sql += " AND worker_pid = ?"
+            params.append(int(expected_worker_pid))
+        cur = conn.execute(sql, tuple(params))
         if cur.rowcount != 1:
             return
-        run_id = _current_run_id(conn, task_id)
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else _current_run_id(conn, task_id)
+        )
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
@@ -7574,6 +8081,7 @@ def _defer_reclaim_for_live_worker(
             "reason": reason,
             "claim_lock": claim_lock,
             "claim_expires_now": grace,
+            "run_id": run_id,
         }
         payload.update(termination)
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
@@ -7585,6 +8093,8 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_worker_pid: Optional[int] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -7605,11 +8115,21 @@ def heartbeat_worker(
                 (now, task_id),
             )
         else:
-            cur = conn.execute(
+            sql = (
                 "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
+                "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+                "AND EXISTS (SELECT 1 FROM task_runs r "
+                "WHERE r.id = tasks.current_run_id AND r.status = 'running' "
+                "AND r.ended_at IS NULL)"
             )
+            params: list[Any] = [now, task_id, int(expected_run_id)]
+            if expected_claim_lock is not None:
+                sql += " AND claim_lock = ?"
+                params.append(expected_claim_lock)
+            if expected_worker_pid is not None:
+                sql += " AND worker_pid = ?"
+                params.append(int(expected_worker_pid))
+            cur = conn.execute(sql, tuple(params))
         if cur.rowcount != 1:
             return False
         run_id = (
@@ -7630,6 +8150,83 @@ def heartbeat_worker(
     return True
 
 
+def request_worker_stop(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    outcome: str,
+    error: str,
+    metadata: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Persist terminal intent without releasing the live worker's claim.
+
+    The supervisor closes/requeues this exact run only after its process group
+    is verified gone. This is the worker-side half of timeout handoff.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT t.status, t.current_run_id, t.worker_pid, "
+            "       r.status AS run_status, r.metadata AS run_metadata "
+            "FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] != int(expected_run_id)
+            or row["run_status"] != "running"
+        ):
+            return False
+
+        run_metadata: dict[str, Any] = {}
+        if row["run_metadata"]:
+            try:
+                decoded = json.loads(row["run_metadata"])
+                if isinstance(decoded, dict):
+                    run_metadata = decoded
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        terminal_request: dict[str, Any] = {
+            "operation": "worker_stop",
+            "outcome": outcome,
+            "error": error[:500],
+        }
+        if metadata:
+            terminal_request["metadata"] = dict(metadata)
+        run_metadata["terminal_request"] = terminal_request
+
+        cur = conn.execute(
+            "UPDATE task_runs SET status = 'stopping', outcome = ?, error = ?, "
+            "metadata = ? WHERE id = ? AND status = 'running' AND ended_at IS NULL",
+            (
+                outcome,
+                error[:500],
+                json.dumps(run_metadata, sort_keys=True),
+                int(expected_run_id),
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        pid = int(row["worker_pid"]) if row["worker_pid"] is not None else None
+        _append_event(
+            conn,
+            task_id,
+            "termination_requested",
+            {
+                "run_id": int(expected_run_id),
+                "pid": pid,
+                "process_group_id": pid if pid is not None and os.name != "nt" else None,
+                "terminal_outcome": outcome,
+                "process_group_exit_verified": False,
+                "metadata": dict(metadata or {}),
+            },
+            run_id=int(expected_run_id),
+        )
+        return True
+
+
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
@@ -7647,7 +8244,6 @@ def enforce_max_runtime(
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7655,7 +8251,7 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, t.current_run_id "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -7675,31 +8271,26 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid,
+            row["claim_lock"],
+            signal_fn=signal_fn,
+            task_id=tid,
+            expected_run_id=row["current_run_id"],
+            expected_db_path=_connection_db_path(conn),
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        if not termination.get("terminated"):
+            _defer_reclaim_for_live_worker(
+                conn,
+                tid,
+                row["claim_lock"],
+                now,
+                termination,
+                reason="max_runtime_process_group_alive",
+                expected_run_id=row["current_run_id"],
+                expected_worker_pid=row["worker_pid"],
+            )
+            continue
 
         with write_txn(conn):
             cur = conn.execute(
@@ -7707,16 +8298,21 @@ def enforce_max_runtime(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
+                "  AND current_run_id IS ? "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (tid, pid, row["claim_lock"]),
+                (tid, row["current_run_id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                payload = {
+                payload = dict(termination)
+                payload.update({
+                    "run_id": row["current_run_id"],
                     "pid": pid,
+                    "process_group_id": pid if os.name != "nt" else None,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
-                }
+                    "terminal_outcome": "timed_out",
+                    "process_group_exit_verified": True,
+                })
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -7739,7 +8335,12 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed},
+                event_payload_extra={
+                    "pid": pid,
+                    "process_group_id": pid if os.name != "nt" else None,
+                    "process_group_exit_verified": True,
+                    "sigkill": termination.get("sigkill", False),
+                },
             )
     return timed_out
 
@@ -7789,6 +8390,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -7815,7 +8417,12 @@ def detect_stale_running(
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+            pid,
+            lock,
+            signal_fn=signal_fn,
+            task_id=tid,
+            expected_run_id=row["current_run_id"],
+            expected_db_path=_connection_db_path(conn),
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -7824,6 +8431,8 @@ def detect_stale_running(
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
+                expected_run_id=row["current_run_id"],
+                expected_worker_pid=row["worker_pid"],
             )
             continue
 
@@ -7833,8 +8442,14 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
+                "  AND current_run_id IS ? AND worker_pid IS ? "
                 "  AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
+                (
+                    tid,
+                    row["current_run_id"],
+                    row["worker_pid"],
+                    row["claim_lock"],
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -7849,6 +8464,12 @@ def detect_stale_running(
                 ),
                 "timeout_seconds": stale_timeout_seconds,
                 "pid": int(pid) if pid else None,
+                "process_group_id": int(pid) if pid and os.name != "nt" else None,
+                "run_id": row["current_run_id"],
+                "terminal_outcome": "stale",
+                "process_group_exit_verified": bool(
+                    pid is None or termination.get("terminated")
+                ),
             }
             payload.update(termination)
 
@@ -8067,235 +8688,361 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 
 
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
-    """Reclaim ``running`` tasks whose worker PID is no longer alive.
+    """Finalize dead workers only after their process group is verified gone.
 
-    Appends a ``crashed`` event and drops the task back to ``ready``.
-    Different from ``release_stale_claims``: this checks liveness
-    immediately rather than waiting for the claim TTL.
-
-    Only considers tasks claimed by *this host* — PIDs from other hosts
-    are meaningless here. The host-local check is enough because
-    ``_default_spawn`` always runs the worker on the same host as the
-    dispatcher (the whole design is single-host).
-
-    When the reap registry shows the worker exited cleanly (rc=0) but
-    the task was still ``running`` in the DB, treat it as a protocol
-    violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
-
-    When the reap registry shows the worker exited with the rate-limit
-    sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
-    provider quota wall, NOT a task failure. Such tasks are released back
-    to ``ready`` WITHOUT counting a failure (so a long quota window can't
-    trip the breaker) and stamped with a quota-blocker error so
-    ``check_respawn_guard`` defers their respawn until the window clears.
-    The ids are returned via the ``_last_rate_limited`` function attribute
-    (the public return stays the crashed-only ``list[str]``).
+    The task/run/claim/PID snapshot is fenced again in the transition CAS, so a
+    stale reaper can never close a newer run.  Timeout sentinel exits and
+    dependency-wait stop requests are supervisor-owned terminal handoffs, not
+    ordinary crashes.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
-    # Per-crash details collected inside the main txn, used after it
-    # closes to run ``_record_task_failure`` (which needs its own
-    # write_txn so can't nest). ``protocol_violation`` flags the
-    # clean-exit-but-still-running case, which is accounted against its
-    # own bounded violation streak instead of the unified failure
-    # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
-    with write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-        for row in rows:
-            # Only check liveness for claims owned by this host.
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
-                continue
-            # Skip liveness check inside the launch-window grace period
-            # so a freshly-spawned worker isn't reclaimed before its PID
-            # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
-            if started_at is not None:
-                grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
+    timed_out: list[str] = []
+    auto_blocked: list[str] = []
+    crash_details: list[tuple[str, int, str, bool, str, str]] = []
+    blocked_hooks: list[tuple[str, int, Optional[str], Optional[str]]] = []
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.claim_lock, t.started_at, "
+        "       t.current_run_id, t.assignee, "
+        "       r.status AS run_status, r.outcome AS run_outcome, "
+        "       r.summary AS run_summary, r.metadata AS run_metadata "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
+    ).fetchall()
+
+    for row in rows:
+        task_id = row["id"]
+        pid = int(row["worker_pid"])
+        claim_lock = row["claim_lock"] or ""
+        current_run_id = (
+            int(row["current_run_id"])
+            if row["current_run_id"] is not None
+            else None
+        )
+        run_metadata: dict[str, Any] = {}
+        if row["run_metadata"]:
+            try:
+                decoded = json.loads(row["run_metadata"])
+                if isinstance(decoded, dict):
+                    run_metadata = decoded
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        terminal_request = run_metadata.get("terminal_request")
+        if not isinstance(terminal_request, dict):
+            terminal_request = {}
+        stop_requested = (
+            row["run_status"] == "stopping"
+            and terminal_request.get("operation")
+            in {"block_wait", "dependency_wait", "worker_stop"}
+        )
+        if not claim_lock.startswith(host_prefix):
+            continue
+        started_at = row["started_at"]
+        if (
+            not stop_requested
+            and
+            started_at is not None
+            and time.time() - int(started_at) < _resolve_crash_grace_seconds()
+        ):
+            continue
+        if _pid_alive(pid) and not stop_requested:
+            continue
+
+        # The leader is gone, but descendants in its session may still be
+        # running.  Do not expose ``ready`` until the process group is proven
+        # absent (or has been TERM/KILLed and then observed absent).
+        termination = _terminate_reclaimed_worker(
+            pid,
+            claim_lock,
+            task_id=task_id,
+            expected_run_id=current_run_id,
+            expected_db_path=_connection_db_path(conn),
+        )
+        if not termination.get("terminated"):
+            _defer_reclaim_for_live_worker(
+                conn,
+                task_id,
+                claim_lock,
+                int(time.time()),
+                termination,
+                reason=(
+                    "terminal_request_process_group_alive"
+                    if stop_requested
+                    else "dead_leader_process_group_alive"
+                ),
+                expected_run_id=current_run_id,
+                expected_worker_pid=pid,
+            )
+            continue
+
+        # A worker-requested dependency wait remains ``running`` until this
+        # exact point.  Only now may it enter todo/recompute/claim flow.
+        if (
+            row["run_status"] == "stopping"
+            and terminal_request.get("operation") == "dependency_wait"
+        ):
+            reason = terminal_request.get("reason") or row["run_summary"]
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'todo', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, block_kind = 'dependency' "
+                    "WHERE id = ? AND status = 'running' "
+                    "AND current_run_id IS ? AND worker_pid = ? AND claim_lock IS ?",
+                    (task_id, current_run_id, pid, row["claim_lock"]),
+                )
+                if cur.rowcount != 1:
                     continue
-            if _pid_alive(row["worker_pid"]):
-                continue
-
-            pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
+                terminal_metadata = dict(termination)
+                terminal_metadata.update({
+                    "run_id": current_run_id,
                     "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
-                rate_limited_exit = True
-                error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
+                    "process_group_id": pid if os.name != "nt" else None,
+                    "terminal_outcome": "blocked",
+                    "next_status": "todo",
+                    "terminal_request": terminal_request,
+                })
+                run_id = _end_run(
+                    conn,
+                    task_id,
+                    outcome="blocked",
+                    status="blocked",
+                    summary=reason,
+                    metadata=terminal_metadata,
                 )
-                event_kind = "rate_limited"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
+                _append_event(
+                    conn,
+                    task_id,
+                    "dependency_wait",
+                    {
+                        "reason": reason,
+                        "kind": "dependency",
+                        "run_id": run_id,
+                        "pid": pid,
+                        "process_group_id": pid if os.name != "nt" else None,
+                        "terminal_outcome": "blocked",
+                        "process_group_exit_verified": True,
+                    },
+                    run_id=run_id,
+                )
+                if run_id is not None:
+                    blocked_hooks.append((task_id, run_id, row["assignee"], reason))
+            continue
 
+        # A worker-requested human/transient/capability block uses the same
+        # process-exit barrier as dependency waits.  Applying ``blocked`` or
+        # ``triage`` any earlier lets an unblocker expose a replacement while
+        # the old process group can still mutate shared state.
+        if (
+            row["run_status"] == "stopping"
+            and terminal_request.get("operation") == "block_wait"
+        ):
+            next_status = str(terminal_request.get("next_status") or "blocked")
+            if next_status not in {"blocked", "triage"}:
+                next_status = "blocked"
+            reason = terminal_request.get("reason") or row["run_summary"]
+            block_kind = terminal_request.get("kind")
+            try:
+                recurrences = max(1, int(terminal_request.get("recurrences") or 1))
+            except (TypeError, ValueError):
+                recurrences = 1
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, block_kind = ?, "
+                    "block_recurrences = ? "
+                    "WHERE id = ? AND status = 'running' "
+                    "AND current_run_id IS ? AND worker_pid = ? AND claim_lock IS ?",
+                    (
+                        next_status,
+                        block_kind,
+                        recurrences,
+                        task_id,
+                        current_run_id,
+                        pid,
+                        row["claim_lock"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    continue
+                terminal_metadata = dict(termination)
+                terminal_metadata.update({
+                    "run_id": current_run_id,
+                    "pid": pid,
+                    "process_group_id": pid if os.name != "nt" else None,
+                    "terminal_outcome": "blocked",
+                    "next_status": next_status,
+                    "terminal_request": terminal_request,
+                })
+                run_id = _end_run(
+                    conn,
+                    task_id,
+                    outcome="blocked",
+                    status="blocked",
+                    summary=reason,
+                    metadata=terminal_metadata,
+                )
+                event_kind = (
+                    "block_loop_detected" if next_status == "triage" else "blocked"
+                )
+                payload = {
+                    "reason": reason,
+                    "kind": block_kind,
+                    "recurrences": recurrences,
+                    "run_id": run_id,
+                    "pid": pid,
+                    "process_group_id": pid if os.name != "nt" else None,
+                    "terminal_outcome": "blocked",
+                    "next_status": next_status,
+                    "process_group_exit_verified": True,
+                }
+                if next_status == "triage":
+                    payload["limit"] = BLOCK_RECURRENCE_LIMIT
+                _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+                if run_id is not None:
+                    blocked_hooks.append((task_id, run_id, row["assignee"], reason))
+            continue
+
+        kind, code = _classify_worker_exit(pid)
+        protocol_violation = False
+        count_failure = True
+        include_in_crashed = True
+        outcome = "crashed"
+        event_kind = "crashed"
+
+        if (
+            terminal_request.get("operation") == "worker_stop"
+            and terminal_request.get("outcome") == "timed_out"
+        ):
+            outcome = "timed_out"
+            event_kind = "timed_out"
+            error_text = str(
+                terminal_request.get("error")
+                or f"pid {pid} exited after a supervised timeout request"
+            )
+            include_in_crashed = False
+        elif kind == "clean_exit":
+            protocol_violation = True
+            error_text = (
+                "worker exited cleanly (rc=0) without calling kanban_complete "
+                "or kanban_block — protocol violation. If the prior run already "
+                "did the work, verify it and report via kanban_complete."
+            )
+            event_kind = "protocol_violation"
+        elif kind == "rate_limited":
+            outcome = "rate_limited"
+            event_kind = "rate_limited"
+            error_text = (
+                f"pid {pid} exited rate-limited (quota wall) — requeued "
+                "without counting a failure"
+            )
+            count_failure = False
+            include_in_crashed = False
+        elif kind == "timed_out":
+            outcome = "timed_out"
+            event_kind = "timed_out"
+            error_text = (
+                f"pid {pid} exhausted its iteration budget and exited with "
+                "the supervised timeout sentinel"
+            )
+            include_in_crashed = False
+        elif kind == "nonzero_exit":
+            error_text = f"pid {pid} exited with code {code}"
+        elif kind == "signaled":
+            error_text = f"pid {pid} killed by signal {code}"
+        else:
+            error_text = f"pid {pid} not alive"
+
+        event_payload = dict(termination)
+        event_payload.update({
+            "run_id": current_run_id,
+            "pid": pid,
+            "process_group_id": pid if os.name != "nt" else None,
+            "claimer": row["claim_lock"],
+            "exit_kind": kind,
+            "exit_code": code,
+            "terminal_outcome": outcome,
+            "process_group_exit_verified": True,
+        })
+        if protocol_violation:
+            event_payload["protocol_violation"] = True
+
+        with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                "AND current_run_id IS ? AND worker_pid = ? AND claim_lock IS ?",
+                (task_id, current_run_id, pid, row["claim_lock"]),
             )
-            if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
-                run_id = _end_run(
-                    conn, row["id"],
-                    outcome=_run_outcome, status=_run_outcome,
-                    error=error_text,
-                    metadata=dict(event_payload),
+            if cur.rowcount != 1:
+                continue
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome=outcome,
+                status=outcome,
+                error=error_text,
+                metadata=event_payload,
+            )
+            _append_event(
+                conn,
+                task_id,
+                event_kind,
+                event_payload,
+                run_id=run_id,
+            )
+            if protocol_violation or not count_failure:
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    (error_text[:500], task_id),
                 )
-                _append_event(
-                    conn, row["id"], event_kind,
-                    event_payload,
-                    run_id=run_id,
+
+        if outcome == "rate_limited":
+            rate_limited.append(task_id)
+        elif outcome == "timed_out":
+            timed_out.append(task_id)
+        elif include_in_crashed:
+            crashed.append(task_id)
+        if count_failure:
+            crash_details.append(
+                (
+                    task_id,
+                    pid,
+                    row["claim_lock"],
+                    protocol_violation,
+                    error_text,
+                    outcome,
                 )
-                if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
-                    # ``consecutive_failures`` (that's the whole point: no
-                    # breaker trip on a throttle).
-                    conn.execute(
-                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                        (error_text[:500], row["id"]),
-                    )
-                    rate_limited.append(row["id"])
-                else:
-                    if protocol_violation:
-                        # Stamp the failure error now: a below-budget
-                        # violation never reaches ``_record_task_failure``
-                        # (which stamps this column for every other failure
-                        # kind), yet the board UI and the retry worker's
-                        # context still need the violation message + the
-                        # corrective guidance it carries.
-                        conn.execute(
-                            "UPDATE tasks SET last_failure_error = ? "
-                            "WHERE id = ?",
-                            (error_text[:500], row["id"]),
-                        )
-                    crashed.append(row["id"])
-                    crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
-                    )
-    # Outside the main txn: account each crashed task and maybe trip the
-    # breaker (the task transitions ready → blocked with a ``gave_up`` event
-    # on top of the event we already emitted).
-    #
-    # Protocol-violation crashes (clean exit, no terminal tool call) get a
-    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
-    # complete on a later run (a goal-mode finalize nudge, or the model simply
-    # emitting kanban_complete/kanban_block next time), so blocking on the first
-    # occurrence just churned them through the respawn cycle. The retry budget
-    # is a violation-only streak (``_protocol_violation_streak``): earlier
-    # timeouts / nonzero exits neither consume nor extend it, and a
-    # below-budget violation does not tick the unified
-    # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
-    # crashes still trip immediately.
-    auto_blocked: list[str] = []
+            )
+
     if crash_details:
-        # Fingerprint errors to detect systemic failures.
-        _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
-            fp = _error_fingerprint(err_text)
-            _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        fp_counts: dict[str, int] = {}
+        for _, _, _, protocol_violation, error_text, _ in crash_details:
+            if not protocol_violation:
+                fp = _error_fingerprint(error_text)
+                fp_counts[fp] = fp_counts.get(fp, 0) + 1
+        for task_id, pid, claimer, protocol_violation, error_text, outcome in crash_details:
             if protocol_violation:
-                streak = _protocol_violation_streak(conn, tid)
-                trow = conn.execute(
-                    "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
+                streak = _protocol_violation_streak(conn, task_id)
+                task_row = conn.execute(
+                    "SELECT max_retries FROM tasks WHERE id = ?", (task_id,),
                 ).fetchone()
-                if trow is None:
-                    continue  # task deleted mid-loop
-                task_override = (
-                    trow["max_retries"] if "max_retries" in trow.keys() else None
-                )
+                if task_row is None:
+                    continue
+                task_override = task_row["max_retries"]
                 violation_limit = (
                     int(task_override)
                     if task_override is not None
                     else _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 )
                 if streak < violation_limit:
-                    # Below budget: the task is already back at ``ready``
-                    # (respawn allowed) with ``last_failure_error`` stamped.
-                    # Deliberately no ``_record_task_failure`` call — a
-                    # below-budget violation must not consume the unified
-                    # failure budget, just as other failure kinds don't
-                    # consume this one.
                     continue
-                # Streak reached the bound: trip the breaker. ``force_trip``
-                # skips the threshold resolution inside
-                # ``_record_task_failure`` because the decision — including
-                # the per-task ``max_retries`` override — was already made
-                # against the violation streak above.
                 tripped = _record_task_failure(
-                    conn, tid,
+                    conn,
+                    task_id,
                     error=error_text,
                     outcome="crashed",
                     failure_limit=violation_limit,
@@ -8304,35 +9051,44 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     end_run=False,
                     event_payload_extra={
                         "pid": pid,
+                        "process_group_id": pid if os.name != "nt" else None,
                         "claimer": claimer,
                         "protocol_violations": streak,
                         "protocol_violation_limit": violation_limit,
                     },
                 )
-                if tripped:
-                    auto_blocked.append(tid)
-                continue
-            fp = _error_fingerprint(error_text)
-            is_systemic = _fp_counts.get(fp, 0) >= 3
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
-                failure_limit=1 if is_systemic else None,
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer},
-            )
+            else:
+                fp = _error_fingerprint(error_text)
+                tripped = _record_task_failure(
+                    conn,
+                    task_id,
+                    error=error_text,
+                    outcome=outcome,
+                    failure_limit=1 if fp_counts.get(fp, 0) >= 3 else None,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid,
+                        "process_group_id": pid if os.name != "nt" else None,
+                        "claimer": claimer,
+                    },
+                )
             if tripped:
-                auto_blocked.append(tid)
-    # Stash auto-blocked ids on the function for the dispatch loop to pick up.
-    # Keeps the public return type (``list[str]``) stable for direct callers
-    # and tests that destructure the result; ``dispatch_once`` reads this
-    # side-channel attribute to populate ``DispatchResult.auto_blocked``.
+                auto_blocked.append(task_id)
+
+    for task_id, run_id, assignee, reason in blocked_hooks:
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=assignee,
+            run_id=run_id,
+            reason=reason,
+        )
+
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
-    # Same side-channel for rate-limited requeues — these did NOT count a
-    # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_timed_out = timed_out  # type: ignore[attr-defined]
     return crashed
 
 
@@ -8347,6 +9103,9 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_worker_pid: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -8361,7 +9120,9 @@ def _record_task_failure(
 
     Modes:
 
-    * ``release_claim=True, end_run=True`` — spawn-failure path.
+    * ``release_claim=True`` — spawn-failure path. Releasing a claim always
+      closes any open run, even for legacy callers that pass ``end_run=False``;
+      a ready task with an active run is deliberately unclaimable.
       Caller has a running task with an open run; this transitions
       it back to ``ready`` (or ``blocked`` when the breaker trips),
       releases the claim, and closes the run with ``outcome=<outcome>``.
@@ -8396,13 +9157,25 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, "
+            "       current_run_id, claim_lock, worker_pid "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
+        if release_claim and expected_run_id is not None:
+            if (
+                row["current_run_id"] != int(expected_run_id)
+                or row["claim_lock"] != expected_claim_lock
+                or (
+                    expected_worker_pid is not None
+                    and row["worker_pid"] != int(expected_worker_pid)
+                )
+            ):
+                # A newer owner won before spawn-failure cleanup. Failure
+                # bookkeeping for the old attempt must not release that claim.
+                return False
         failures = int(row["consecutive_failures"]) + 1
-        cur_status = row["status"]
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -8429,17 +9202,32 @@ def _record_task_failure(
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
-                # counter fields.
-                conn.execute(
+                # with claim cleared. The accounting call happens after the
+                # terminal transition commits, so a replacement may claim in
+                # between. Only trip the breaker while the task is still the
+                # exact unowned ready row left by that terminal transition.
+                task_cur = conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status = 'ready' "
+                    "AND current_run_id IS NULL AND claim_lock IS NULL "
+                    "AND worker_pid IS NULL",
                     (failures, error[:500], task_id),
                 )
+                if task_cur.rowcount != 1:
+                    # Preserve historical accounting, but never terminalize a
+                    # newer run that won the ready→running claim race.
+                    conn.execute(
+                        "UPDATE tasks SET consecutive_failures = ?, "
+                        "last_failure_error = ? WHERE id = ?",
+                        (failures, error[:500], task_id),
+                    )
+                    return False
             run_id = None
-            if end_run:
-                # Only the spawn path has an open run to close.
+            if release_claim or end_run:
+                # Releasing a claim must close the run before the task can be
+                # claimed again. ``end_run`` remains as a compatibility flag
+                # for callers that already transitioned the task themselves.
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
@@ -8483,8 +9271,8 @@ def _record_task_failure(
                     "last_failure_error = ? WHERE id = ?",
                     (failures, error[:500], task_id),
                 )
-            if end_run:
-                # Spawn path: close the open run with outcome.
+            if release_claim or end_run:
+                # A claim release and run close are one state transition.
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
@@ -8508,6 +9296,9 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_worker_pid: Optional[int] = None,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -8515,28 +9306,89 @@ def _record_spawn_failure(
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        expected_run_id=expected_run_id,
+        expected_claim_lock=expected_claim_lock,
+        expected_worker_pid=expected_worker_pid,
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
-
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
-    """
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
+) -> bool:
+    """Persist the spawned worker's fenced leader/process-group identity."""
+    process_group_id = int(pid) if os.name != "nt" else None
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
-        )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+        if expected_run_id is None:
+            task_cur = conn.execute(
+                "UPDATE tasks SET worker_pid = ? "
+                "WHERE id = ? AND status = 'running' AND current_run_id IS NOT NULL",
+                (int(pid), task_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+            run_id = _current_run_id(conn, task_id)
+        else:
+            task_cur = conn.execute(
+                "UPDATE tasks SET worker_pid = ? "
+                "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+                "AND claim_lock IS ? AND worker_pid IS NULL",
+                (
+                    int(pid),
+                    task_id,
+                    int(expected_run_id),
+                    expected_claim_lock,
+                ),
+            )
+            run_id = int(expected_run_id)
+        if task_cur.rowcount != 1 or run_id is None:
+            return False
+
+        run_row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        run_metadata: dict[str, Any] = {}
+        if run_row is not None and run_row["metadata"]:
+            try:
+                decoded = json.loads(run_row["metadata"])
+                if isinstance(decoded, dict):
+                    run_metadata = decoded
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        run_metadata["worker_identity"] = {
+            "pid": int(pid),
+            "process_group_id": process_group_id,
+            "signal_scope": (
+                "process_group" if process_group_id is not None else "process"
+            ),
+        }
+        run_cur = conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, metadata = ? "
+            "WHERE id = ? AND status = 'running' AND ended_at IS NULL",
+            (int(pid), json.dumps(run_metadata, ensure_ascii=False), run_id),
+        )
+        if run_cur.rowcount != 1:
+            raise TaskCommandConflict(
+                "run_changed",
+                "the worker run changed before PID registration",
+            )
+        _append_event(
+            conn,
+            task_id,
+            "spawned",
+            {
+                "run_id": run_id,
+                "pid": int(pid),
+                "process_group_id": process_group_id,
+                "signal_scope": (
+                    "process_group" if process_group_id is not None else "process"
+                ),
+            },
+            run_id=run_id,
+        )
+        return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8900,7 +9752,13 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
+    _crash_timed_out = getattr(
+        detect_crashed_workers, "_last_timed_out", []
+    )
+    result.timed_out = list(_crash_timed_out)
+    for task_id in enforce_max_runtime(conn):
+        if task_id not in result.timed_out:
+            result.timed_out.append(task_id)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -8921,6 +9779,7 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        "AND current_run_id IS NULL AND worker_pid IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
@@ -9102,6 +9961,8 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -9112,6 +9973,7 @@ def _dispatch_once_locked(
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        pid: Optional[int] = None
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
@@ -9126,7 +9988,43 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                registered = _set_worker_pid(
+                    conn,
+                    claimed.id,
+                    int(pid),
+                    expected_run_id=claimed.current_run_id,
+                    expected_claim_lock=claimed.claim_lock,
+                )
+                if not registered:
+                    worker_effect = "unmanaged_test_spawn"
+                    if spawn_fn is None:
+                        worker_effect = _terminate_cancel_worker_group(int(pid))
+                    with write_txn(conn):
+                        current = conn.execute(
+                            "SELECT current_run_id, claim_lock FROM tasks WHERE id = ?",
+                            (claimed.id,),
+                        ).fetchone()
+                        if (
+                            current is not None
+                            and current["current_run_id"] == claimed.current_run_id
+                            and current["claim_lock"] == claimed.claim_lock
+                        ):
+                            _append_event(
+                                conn,
+                                claimed.id,
+                                "spawn_discarded",
+                                {
+                                    "run_id": claimed.current_run_id,
+                                    "pid": int(pid),
+                                    "process_group_id": (
+                                        int(pid) if os.name != "nt" else None
+                                    ),
+                                    "worker_effect": worker_effect,
+                                    "reason": "claim_changed_before_pid_registration",
+                                },
+                                run_id=claimed.current_run_id,
+                            )
+                    continue
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -9144,9 +10042,35 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            if pid and spawn_fn is None:
+                worker_effect = _terminate_cancel_worker_group(int(pid))
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        claimed.id,
+                        "spawn_cleanup",
+                        {
+                            "run_id": claimed.current_run_id,
+                            "pid": int(pid),
+                            "process_group_id": int(pid) if os.name != "nt" else None,
+                            "worker_effect": worker_effect or "unconfirmed",
+                            "reason": "spawn_exception",
+                        },
+                        run_id=claimed.current_run_id,
+                    )
+                if worker_effect is None:
+                    logger.critical(
+                        "spawned worker group %s for task %s remains unconfirmed "
+                        "after spawn exception; retaining the active claim",
+                        pid,
+                        claimed.id,
+                    )
+                    continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -9194,6 +10118,8 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -9210,6 +10136,7 @@ def _dispatch_once_locked(
         # review agent needs.
         claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        pid = None
         try:
             import inspect
             try:
@@ -9221,13 +10148,49 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                registered = _set_worker_pid(
+                    conn,
+                    claimed.id,
+                    int(pid),
+                    expected_run_id=claimed.current_run_id,
+                    expected_claim_lock=claimed.claim_lock,
+                )
+                if not registered:
+                    if spawn_fn is None:
+                        _terminate_cancel_worker_group(int(pid))
+                    continue
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
+            if pid and spawn_fn is None:
+                worker_effect = _terminate_cancel_worker_group(int(pid))
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        claimed.id,
+                        "spawn_cleanup",
+                        {
+                            "run_id": claimed.current_run_id,
+                            "pid": int(pid),
+                            "process_group_id": int(pid) if os.name != "nt" else None,
+                            "worker_effect": worker_effect or "unconfirmed",
+                            "reason": "review_spawn_exception",
+                        },
+                        run_id=claimed.current_run_id,
+                    )
+                if worker_effect is None:
+                    logger.critical(
+                        "spawned review worker group %s for task %s remains "
+                        "unconfirmed after spawn exception; retaining the claim",
+                        pid,
+                        claimed.id,
+                    )
+                    continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -9524,6 +10487,20 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    # A dispatcher can itself run inside a Kanban worker during tests or nested
+    # orchestration. Never leak the parent's ownership/goal identity into the
+    # child; only the exact values persisted for ``task`` below are valid.
+    for key in (
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_BRANCH",
+        "HERMES_KANBAN_GOAL_MODE",
+        "HERMES_KANBAN_GOAL_MAX_TURNS",
+        "HERMES_TENANT",
+    ):
+        env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -9794,6 +10771,36 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    if task.current_run_id is not None:
+        active_run = conn.execute(
+            "SELECT status, outcome, worker_pid FROM task_runs WHERE id = ?",
+            (task.current_run_id,),
+        ).fetchone()
+        active_pid = (
+            int(active_run["worker_pid"])
+            if active_run is not None and active_run["worker_pid"] is not None
+            else task.worker_pid
+        )
+        lines.append("")
+        lines.append("## Authoritative worker ownership")
+        lines.append(f"Authoritative current run: {task.current_run_id}")
+        lines.append(f"Authoritative worker PID: {active_pid or '(spawn pending)'}")
+        lines.append(
+            "Authoritative process group: "
+            + (
+                str(active_pid)
+                if active_pid is not None and os.name != "nt"
+                else "(not available)"
+            )
+        )
+        if active_run is not None:
+            run_outcome = active_run["outcome"] or "(pending)"
+            lines.append(f"Authoritative run status: {active_run['status']}")
+            lines.append(f"Authoritative terminal outcome: {run_outcome}")
+        lines.append(
+            "Only this run identity is current. Prior-attempt prose below is "
+            "historical evidence, never an ownership signal."
+        )
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")

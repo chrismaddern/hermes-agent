@@ -109,6 +109,8 @@ def finalize_turn(
 
     iteration_limit_fallback = False
     preserved_verification_fallback = False
+    kanban_exit_outcome = None
+    kanban_exit_metadata = None
     if continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
@@ -142,53 +144,53 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
-        #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # A kanban worker must not release its own claim while it is still
+        # executing finalization: a dispatcher can claim a replacement before
+        # this process (or one of its tool children) exits.  Surface an explicit
+        # exit outcome to the quiet CLI instead.  It exits with the timeout
+        # sentinel; the dispatcher reaps it, stops/verifies the full process
+        # group, then records the failure and requeues.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
+            kanban_exit_outcome = "timed_out"
+            kanban_exit_metadata = {
+                "budget_used": api_call_count,
+                "budget_max": agent.max_iterations,
+            }
+            logger.info(
+                "requesting supervised timeout for task %s (%d/%d)",
+                _kanban_task, api_call_count, agent.max_iterations,
+            )
+            _kanban_run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
             try:
-                from hermes_cli import kanban_db as _kb
-                _conn = _kb.connect()
+                _expected_run_id = int(_kanban_run)
+            except ValueError:
+                _expected_run_id = None
+            if _expected_run_id is not None:
                 try:
-                    _kb._record_task_failure(
-                        _conn,
+                    from hermes_cli import kanban_db as _kb
+
+                    with _kb.connect_closing() as _conn:
+                        _kb.request_worker_stop(
+                            _conn,
+                            _kanban_task,
+                            expected_run_id=_expected_run_id,
+                            outcome="timed_out",
+                            error=(
+                                f"iteration budget exhausted "
+                                f"({api_call_count}/{agent.max_iterations})"
+                            ),
+                            metadata=kanban_exit_metadata,
+                        )
+                except Exception:
+                    # The timeout sentinel is the durable fallback: the
+                    # dispatcher can still classify the process exit even if
+                    # this best-effort intent write loses a DB race/lock.
+                    logger.warning(
+                        "failed to persist supervised timeout request for %s",
                         _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
+                        exc_info=True,
                     )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
-                finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-            except Exception:
-                logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
-                    _kanban_task,
-                    exc_info=True,
-                )
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
@@ -554,6 +556,9 @@ def finalize_turn(
     # (the response is still returned either way — #8049).
     if _cleanup_errors:
         result["cleanup_errors"] = _cleanup_errors
+    if kanban_exit_outcome is not None:
+        result["kanban_exit_outcome"] = kanban_exit_outcome
+        result["kanban_exit_metadata"] = kanban_exit_metadata or {}
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.

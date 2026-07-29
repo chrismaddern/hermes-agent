@@ -432,6 +432,16 @@ protocol. If the worker process exits with status 0 while the task is still
 `running`, the dispatcher treats that as a protocol violation and emits a
 `protocol_violation` event.
 
+Worker replacement is fenced by the **run id and process group**, not by task
+status text. A timeout or dependency wait records terminal intent but keeps the
+current claim until the dispatcher has observed the worker's whole process
+group exit. Reclaim, stale detection, and max-runtime enforcement send signals
+to the worker's isolated process group and re-check task id + run id + claim +
+PID in the transition transaction. If identity or exit cannot be proved, the
+claim stays `running` and a replacement is not spawned. `kanban_show()` labels
+the authoritative current run/PID/process group above historical attempt prose;
+stale summaries never transfer ownership.
+
 **Agent-side prevention:** Before the worker exits, Hermes injects up to two
 synthetic nudges when it detects the model is about to stop without a terminal
 board tool call. This catches the common case where the model narrates the next
@@ -1002,11 +1012,13 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 
 | Kind | Payload | When |
 |---|---|---|
-| `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
+| `spawned` | `{run_id, pid, process_group_id, signal_scope}` | Dispatcher successfully started an isolated worker process/session. The POSIX leader PID is also its process-group id. |
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
-| `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
-| `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
-| `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
+| `termination_requested` | `{run_id, pid, process_group_id, terminal_outcome, process_group_exit_verified: false}` | A live worker recorded terminal intent (for example iteration-budget timeout) while retaining its claim for supervisor-owned exit verification. |
+| `reclaim_deferred` | `{reason, run_id, worker_pid, terminated: false}` | The dispatcher could not prove the exact worker process group exited. The claim is extended and no replacement can start. |
+| `reclaimed` | `{stale_lock, run_id, pid, process_group_id, terminal_outcome}` | Claim TTL expired; the exact prior process group was verified gone before the task returned to `ready`. |
+| `crashed` | `{run_id, pid, process_group_id, claimer, terminal_outcome, process_group_exit_verified}` | Worker leader exited unexpectedly; the task returns to `ready` only after its process group is verified gone. |
+| `timed_out` | `{run_id, pid, process_group_id, elapsed_seconds?, limit_seconds?, terminal_outcome, process_group_exit_verified}` | `max_runtime_seconds` or the worker iteration budget was exhausted. The dispatcher re-queues only after supervised process-group exit. |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
 | `respawn_guarded` | `{reason}` | Dispatcher refused to re-spawn this ready task this tick. Reasons: `blocker_auth` (last failure was a quota/auth/429 error — wait for the rate window to reset), `recent_success` (a completed run happened in the last hour — wait for review before re-running), `active_pr` (a GitHub PR URL appears in a recent comment — a prior worker already opened a PR). The task stays in `ready`; the next tick gets another chance to spawn. If the underlying condition persists, the normal `consecutive_failures` circuit breaker will auto-block via `gave_up` after `failure_limit` failures. |
 | `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |

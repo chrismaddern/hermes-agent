@@ -30,6 +30,20 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_stale_kanban_run_is_fenced_before_dispatch(self):
+        with (
+            patch(
+                "agent.kanban_worker_heartbeat.enforce_current_run_ownership",
+                return_value="stale kanban run fenced",
+            ),
+            patch("model_tools.registry.dispatch") as dispatch,
+        ):
+            result = json.loads(handle_function_call("web_search", {"q": "test"}))
+
+        assert result["stale_kanban_run"] is True
+        assert result["tool_not_dispatched"] == "web_search"
+        dispatch.assert_not_called()
+
     def test_exception_returns_json_error(self):
         # Even if something goes wrong, should return valid JSON
         result = handle_function_call("web_search", None)  # None args may cause issues
