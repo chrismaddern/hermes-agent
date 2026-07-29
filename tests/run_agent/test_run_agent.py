@@ -5557,23 +5557,21 @@ class TestRunConversation:
         assert "truncated due to output length limit" in result["error"]
         mock_handle_function_call.assert_not_called()
 
-    def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
+    def test_kanban_stop_requested_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must signal the dispatcher when its
         iteration budget is exhausted, otherwise the task silently re-runs
         forever without ever tripping the failure_limit circuit breaker
         (issue #23216 / #29747 gap 2).
 
-        As of #29747, the exhaustion path routes through
-        ``kanban_db._record_task_failure(outcome="timed_out")`` so the
-        ``consecutive_failures`` counter increments and the dispatcher's
-        ``failure_limit`` breaker eventually trips. The legacy
-        ``kanban_block`` call was replaced because blocked-outcome runs
-        bypass the failure counter.
+        The worker persists a supervised stop intent but retains ownership;
+        the dispatcher records the timeout/failure only after verifying the
+        process group has exited.
         """
         self._setup_agent(agent)
         agent.max_iterations = 2
 
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test_task_123")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "321")
 
         # Return a tool call for every iteration to exhaust the budget.
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
@@ -5589,13 +5587,16 @@ class TestRunConversation:
         ]
 
         mock_record_failure = MagicMock(return_value=False)
-        mock_connect = MagicMock(return_value=MagicMock())
+        mock_connect_closing = MagicMock()
+        connection = mock_connect_closing.return_value.__enter__.return_value
+        mock_request_stop = MagicMock(return_value=True)
 
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
             patch("hermes_cli.kanban_db._record_task_failure",
                   mock_record_failure),
-            patch("hermes_cli.kanban_db.connect", mock_connect),
+            patch("hermes_cli.kanban_db.connect_closing", mock_connect_closing),
+            patch("hermes_cli.kanban_db.request_worker_stop", mock_request_stop),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -5604,21 +5605,17 @@ class TestRunConversation:
 
         # The agent should have reported the task as not completed.
         assert result["completed"] is False
+        assert result["kanban_exit_outcome"] == "timed_out"
 
-        # _record_task_failure should have been called exactly once for
-        # the exhaustion event, with outcome="timed_out".
-        assert mock_record_failure.call_count == 1, (
-            f"Expected exactly 1 _record_task_failure call, "
-            f"got {mock_record_failure.call_count}. "
-            f"Calls: {mock_record_failure.call_args_list}"
+        mock_record_failure.assert_not_called()
+        mock_request_stop.assert_called_once_with(
+            connection,
+            "t_test_task_123",
+            expected_run_id=321,
+            outcome="timed_out",
+            error="iteration budget exhausted (2/2)",
+            metadata={"budget_used": 2, "budget_max": 2},
         )
-        call = mock_record_failure.call_args_list[0]
-        # Positional: (conn, task_id, ...)
-        assert call.args[1] == "t_test_task_123"
-        assert call.kwargs.get("outcome") == "timed_out"
-        assert call.kwargs.get("release_claim") is True
-        assert call.kwargs.get("end_run") is True
-        assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
