@@ -709,6 +709,38 @@ class TestLifecycleGuardModule:
             is False
         )
 
+    def test_nested_embedded_nul_path_does_not_crash_guard(self, tmp_path):
+        """Remote script content can contain NUL bytes that path expansion rejects;
+        the public recursive guard must treat that reference as unreadable."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        missing_outer = tmp_path / "remote-outer.sh"
+
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"bash {missing_outer}",
+                read_remote_script=lambda _path: "~" + chr(0) + "tail/child.sh",
+            )
+            is False
+        )
+
+    def test_nested_unavailable_home_path_does_not_crash_guard(self, tmp_path):
+        """An unavailable ``~user`` found in a real nested script is unreadable,
+        not a synchronous terminal-guard failure."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        outer = tmp_path / "outer.sh"
+        outer.write_text("~definitely_missing_user/child.sh")
+
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(f"bash {outer}")
+            is False
+        )
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
@@ -836,6 +868,36 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
         assert any("cat" in c for c in calls)
+
+    def test_unavailable_home_in_remote_script_does_not_crash_guard(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _RemoteEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                if "cat" in command:
+                    return {
+                        "output": "~definitely_missing_user/child.sh",
+                        "returncode": 0,
+                    }
+                return {"output": "ok", "returncode": 0}
+
+        self._patch_env(monkeypatch, _RemoteEnv(), inside_gateway=True)
+
+        result = json.loads(
+            tt.terminal_tool(command="/bin/bash /remote/workspace/remote.sh")
+        )
+
+        assert result["exit_code"] == 0
+        assert result["output"] == "ok"
+        assert any("cat" in command for command in calls)
 
 
 class TestCronCreateLifecycleBlockExtra:
