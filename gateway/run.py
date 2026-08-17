@@ -13600,6 +13600,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Checks the platform_registry first (plugin adapters), then falls
         through to the built-in if/elif chain for core platforms.
         """
+        if platform == Platform.AGENT_STACK:
+            # This built-in deliberately uses the same registry construction
+            # path as external adapters so config/status/factory behavior stays
+            # consistent.
+            from gateway.platforms.agent_stack import register_agent_stack_adapter
+            register_agent_stack_adapter()
+
         if hasattr(config, "extra") and isinstance(config.extra, dict):
             config.extra.setdefault(
                 "group_sessions_per_user",
