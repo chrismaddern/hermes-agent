@@ -39,6 +39,7 @@ import os
 import re
 import shlex
 import stat
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -110,6 +111,13 @@ _CONTROL_CHARS = frozenset(";&|()")
 
 
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
+
+
+class _ReferencedScriptReadKind(Enum):
+    TEXT = "text"
+    UNAVAILABLE = "unavailable"
+    BINARY = "binary"
+    UNSAFE = "unsafe"
 
 
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
@@ -262,23 +270,25 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+def _read_referenced_script(
+    path: Path,
+) -> tuple[Optional[str], _ReferencedScriptReadKind]:
+    """Return bounded text plus why no text was available, when applicable."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
     except (OSError, ValueError):
-        return None, False
+        return None, _ReferencedScriptReadKind.UNAVAILABLE
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            return None, True
+            return None, _ReferencedScriptReadKind.UNSAFE
         # Read a bounded chunk first — even for oversized files, the first
         # chunk tells us if this is a binary (NUL bytes) that should be
         # skipped as "nothing to scan" rather than failing closed (#76762).
         data = os.read(descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1)
     except OSError:
-        return None, False
+        return None, _ReferencedScriptReadKind.UNAVAILABLE
     finally:
         os.close(descriptor)
     # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
@@ -288,10 +298,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
     # executed by the user is not a referenced *shell script*.
     if b"\x00" in data:
-        return None, False
+        return None, _ReferencedScriptReadKind.BINARY
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
-        return None, True
-    return data.decode("utf-8", errors="replace"), False
+        return None, _ReferencedScriptReadKind.UNSAFE
+    return data.decode("utf-8", errors="replace"), _ReferencedScriptReadKind.TEXT
 
 
 def _contains_unsafe_gateway_action(
@@ -330,10 +340,13 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
-        if unsafe:
+        script_text, read_kind = _read_referenced_script(script_path)
+        if read_kind is _ReferencedScriptReadKind.UNSAFE:
             return True
-        if script_text is None and read_remote_script is not None:
+        if (
+            read_kind is _ReferencedScriptReadKind.UNAVAILABLE
+            and read_remote_script is not None
+        ):
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
         if not script_text:
@@ -396,8 +409,8 @@ def _read_script_for_scanning(script_path: str) -> str:
     sentinel, while missing/unreadable paths remain empty so ordinary scheduler
     path validation can report them.
     """
-    script_text, unsafe = _read_referenced_script(_resolve_script_path(script_path))
-    if unsafe:
+    script_text, read_kind = _read_referenced_script(_resolve_script_path(script_path))
+    if read_kind is _ReferencedScriptReadKind.UNSAFE:
         return "hermes gateway restart"
     return script_text or ""
 
