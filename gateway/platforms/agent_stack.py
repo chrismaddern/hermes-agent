@@ -1217,7 +1217,21 @@ class AgentStackAdapter(BasePlatformAdapter):
             event = self._event_by_turn.get(command["gateway_turn_id"])
             if event is not None:
                 source = event.source
-                session_key = build_session_key(source)
+                session_store = getattr(self, "_session_store", None)
+                session_key = build_session_key(
+                    source,
+                    group_sessions_per_user=self.config.extra.get(
+                        "group_sessions_per_user", True
+                    ),
+                    thread_sessions_per_user=self.config.extra.get(
+                        "thread_sessions_per_user", False
+                    ),
+                    profile=(
+                        session_store._resolve_profile_for_key(source)
+                        if session_store is not None
+                        else None
+                    ),
+                )
                 await self.cancel_session_processing(session_key)
         if result.dispatch is not None:
             await self._dispatch_turn(result.dispatch)
