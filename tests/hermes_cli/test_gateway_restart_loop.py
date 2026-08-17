@@ -494,6 +494,17 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
 
+    def test_oversized_text_script_fails_closed(self, monkeypatch, tmp_path):
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "oversized.sh"
+        script.write_bytes(b"#!/bin/bash\n" + b"x" * (1024 * 1024))
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
+
+        assert result["exit_code"] == 1
+
     def test_quoted_launchctl_submit_text_is_not_blocked(self, monkeypatch):
         import tools.terminal_tool as tt
 
@@ -534,6 +545,40 @@ class TestTerminalToolGatewayLifecycleGuard:
             tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
         )
         command = f"/bin/bash {script}"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
+    def test_large_local_gh_binary_passes_gateway_guard(self, monkeypatch, tmp_path):
+        import tools.terminal_tool as tt
+
+        calls = []
+        binary = tmp_path / "gh"
+        binary.write_bytes(
+            b"\x7fELF\x02\x01\x01\x00" + b"x" * (1024 * 1024 + 1)
+        )
+        binary.chmod(0o755)
+
+        class _FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                if command.startswith("cat "):
+                    return {
+                        "output": "hermes gateway restart",
+                        "returncode": 0,
+                    }
+                return {"output": "[]", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = f"{binary} run list --limit 5"
 
         result = json.loads(tt.terminal_tool(command=command))
 
@@ -694,6 +739,26 @@ class TestLifecycleGuardModule:
             '/usr/bin/python3 -c "print(1)"'
         )
         assert result is False
+
+    def test_large_local_binary_does_not_use_remote_reader(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        binary = tmp_path / "gh"
+        binary.write_bytes(
+            b"\x7fELF\x02\x01\x01\x00" + b"x" * (1024 * 1024 + 1)
+        )
+        remote_reads = []
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"{binary} run list --limit 5",
+            read_remote_script=lambda path: remote_reads.append(path)
+            or "hermes gateway restart",
+        )
+
+        assert result is False
+        assert remote_reads == []
 
     def test_absolute_path_with_embedded_nul_does_not_crash_guard(self):
         """An arbitrary binary-derived path token containing NUL is unreadable,
