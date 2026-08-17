@@ -1059,7 +1059,7 @@ class AgentStackAdapter(BasePlatformAdapter):
         for path in (self.socket_path, self.secret_path):
             if path.exists() or path.is_symlink():
                 st = path.lstat()
-                if st.st_uid != os.getuid():
+                if hasattr(os, "getuid") and st.st_uid != os.getuid():
                     raise RuntimeError("agent_stack runtime file is not owned by this process user")
                 path.unlink()
         self._secret = secrets.token_urlsafe(48)
