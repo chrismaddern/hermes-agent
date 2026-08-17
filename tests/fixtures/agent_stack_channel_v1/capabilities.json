@@ -1,0 +1,235 @@
+{
+  "commands": [
+    "conversation.bind",
+    "turn.submit",
+    "turn.cancel",
+    "event.ack"
+  ],
+  "contract_version": "agent_stack.channel.v1",
+  "dispatch": {
+    "available": true,
+    "degraded_reason": null
+  },
+  "document_type": "capabilities",
+  "error_codes": [
+    {
+      "code": "ack_out_of_range",
+      "retryable": false,
+      "safe_message": "The acknowledgement exceeds the delivered event range.",
+      "terminal": false
+    },
+    {
+      "code": "approval_response_unsupported",
+      "retryable": false,
+      "safe_message": "Approve this action from an authorized Hermes surface.",
+      "terminal": false
+    },
+    {
+      "code": "attachment_forbidden",
+      "retryable": false,
+      "safe_message": "This device cannot access the attachment.",
+      "terminal": false
+    },
+    {
+      "code": "attachment_invalid",
+      "retryable": false,
+      "safe_message": "The attachment descriptor is invalid.",
+      "terminal": false
+    },
+    {
+      "code": "attachment_unavailable",
+      "retryable": true,
+      "safe_message": "The attachment is unavailable.",
+      "terminal": false
+    },
+    {
+      "code": "binding_conflict",
+      "retryable": true,
+      "safe_message": "The conversation binding changed; reconnect and retry.",
+      "terminal": false
+    },
+    {
+      "code": "binding_revoked",
+      "retryable": false,
+      "safe_message": "The conversation binding was revoked.",
+      "terminal": false
+    },
+    {
+      "code": "conversation_forbidden",
+      "retryable": false,
+      "safe_message": "This device cannot access the conversation.",
+      "terminal": false
+    },
+    {
+      "code": "conversation_not_found",
+      "retryable": false,
+      "safe_message": "The conversation is unavailable.",
+      "terminal": false
+    },
+    {
+      "code": "event_payload_conflict",
+      "retryable": false,
+      "safe_message": "An event sequence was reused with different content.",
+      "terminal": false
+    },
+    {
+      "code": "event_too_large",
+      "retryable": false,
+      "safe_message": "The channel event exceeds the allowed size.",
+      "terminal": true
+    },
+    {
+      "code": "execution_failed",
+      "retryable": false,
+      "safe_message": "Hermes could not complete the turn.",
+      "terminal": true
+    },
+    {
+      "code": "execution_interrupted",
+      "retryable": true,
+      "safe_message": "Hermes restarted before the turn finished.",
+      "terminal": true
+    },
+    {
+      "code": "execution_timed_out",
+      "retryable": true,
+      "safe_message": "The turn exceeded its execution limit.",
+      "terminal": true
+    },
+    {
+      "code": "frame_too_large",
+      "retryable": false,
+      "safe_message": "The channel frame exceeds the allowed size.",
+      "terminal": false
+    },
+    {
+      "code": "gateway_unavailable",
+      "retryable": true,
+      "safe_message": "Hermes is temporarily unavailable.",
+      "terminal": false
+    },
+    {
+      "code": "internal_error",
+      "retryable": true,
+      "safe_message": "The channel could not process the request.",
+      "terminal": false
+    },
+    {
+      "code": "invalid_envelope",
+      "retryable": false,
+      "safe_message": "The channel message is invalid.",
+      "terminal": false
+    },
+    {
+      "code": "payload_digest_conflict",
+      "retryable": false,
+      "safe_message": "This command identifier was reused with different content.",
+      "terminal": false
+    },
+    {
+      "code": "projection_failed",
+      "retryable": true,
+      "safe_message": "The conversation view could not be updated.",
+      "terminal": false
+    },
+    {
+      "code": "rate_limited",
+      "retryable": true,
+      "safe_message": "Too many requests; retry later.",
+      "terminal": false
+    },
+    {
+      "code": "sequence_gap",
+      "retryable": true,
+      "safe_message": "Event replay paused until the missing event is available.",
+      "terminal": false
+    },
+    {
+      "code": "stale_gateway_generation",
+      "retryable": false,
+      "safe_message": "The turn belongs to an earlier gateway generation.",
+      "terminal": false
+    },
+    {
+      "code": "transcript_flush_failed",
+      "retryable": true,
+      "safe_message": "The transcript could not be saved.",
+      "terminal": true
+    },
+    {
+      "code": "turn_already_terminal",
+      "retryable": false,
+      "safe_message": "The turn has already finished.",
+      "terminal": false
+    },
+    {
+      "code": "turn_not_found",
+      "retryable": false,
+      "safe_message": "The turn is unavailable.",
+      "terminal": false
+    },
+    {
+      "code": "unsupported_schema_version",
+      "retryable": false,
+      "safe_message": "The peer does not support this schema version.",
+      "terminal": false
+    }
+  ],
+  "events": [
+    "conversation.bound",
+    "turn.accepted",
+    "turn.started",
+    "turn.activity",
+    "turn.text.delta",
+    "turn.text.checkpoint",
+    "turn.approval.required",
+    "turn.resumed",
+    "turn.cancel_requested",
+    "conversation.advanced",
+    "turn.delivery_error",
+    "turn.completed",
+    "turn.failed",
+    "turn.cancelled"
+  ],
+  "features": {
+    "approval_observation": true,
+    "approval_response": false,
+    "attachment_references": true,
+    "client_cursor_gateway_derivation": false,
+    "compression_continuation": true,
+    "cross_surface_observation": true,
+    "durable_event_replay": true,
+    "durable_ingress_dedupe": true,
+    "outbound_artifacts": false,
+    "safe_activity": true,
+    "visible_text_streaming": true
+  },
+  "fixture_schema_version": 1,
+  "limits": {
+    "max_active_turns_per_bridge": 64,
+    "max_attachment_descriptors": 4,
+    "max_client_cursor_bytes": 256,
+    "max_command_payload_bytes": 524288,
+    "max_error_safe_message_bytes": 512,
+    "max_event_bytes": 262144,
+    "max_events_per_turn": 10000,
+    "max_frame_bytes": 1048576,
+    "max_identifier_bytes": 128,
+    "max_safe_activity_title_bytes": 160,
+    "max_visible_text_checkpoint_bytes": 262144,
+    "max_visible_text_delta_bytes": 65536
+  },
+  "platform": "agent_stack",
+  "schema_versions": {
+    "maximum": 1,
+    "minimum": 1
+  },
+  "transport": {
+    "acknowledgement": "highest_contiguous",
+    "client_cursor_owner": "control_api",
+    "delivery": "at_least_once",
+    "framing": "utf8_json_message",
+    "ordering": "per_gateway_turn",
+    "privacy": "private_authenticated_runtime_link"
+  }
+}

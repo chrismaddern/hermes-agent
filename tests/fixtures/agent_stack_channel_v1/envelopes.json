@@ -1,0 +1,520 @@
+{
+  "command_examples": [
+    {
+      "envelope": {
+        "bridge_generation": "bridgegen_v1_0001",
+        "channel_binding_id": "binding_v1_000000000001",
+        "contract_version": "agent_stack.channel.v1",
+        "conversation_id": "conv_v1_0000000000000001",
+        "gateway_turn_id": null,
+        "ingress_id": "ingress_v1_bind_000001",
+        "kind": "conversation.bind",
+        "payload": {
+          "account_id": "account_fixture_0001",
+          "binding_version": 1,
+          "current_hermes_session_id": null,
+          "platform": "agent_stack",
+          "routing_key": "conversation_fixture_0001"
+        },
+        "payload_digest": "sha256:9d118a8070ff9eb7cde00e80bddaa775e4a01fbcb9313255fb0090ef807a2cdd",
+        "schema_version": 1,
+        "sent_at": "2030-01-02T03:04:05Z",
+        "turn_id": null
+      },
+      "name": "bind-existing-conversation"
+    },
+    {
+      "envelope": {
+        "bridge_generation": "bridgegen_v1_0001",
+        "channel_binding_id": "binding_v1_000000000001",
+        "contract_version": "agent_stack.channel.v1",
+        "conversation_id": "conv_v1_0000000000000001",
+        "gateway_turn_id": null,
+        "ingress_id": "ingress_v1_submit_000001",
+        "kind": "turn.submit",
+        "payload": {
+          "attachments": [
+            {
+              "attachment_id": "attachment_v1_000001",
+              "media_type": "image/png",
+              "read_capability": "readcap_v1_opaque_0001",
+              "sha256": "a3a1cdeb929c7e1d6e70aaaa4f5f96d985c7528c200c5a27ad96255182013260",
+              "size_bytes": 18
+            }
+          ],
+          "client_surface": "ios",
+          "retry_of_turn_id": null,
+          "user_message_id": "message_user_v1_000001",
+          "visible_text": "Continue the shared conversation."
+        },
+        "payload_digest": "sha256:530928542db6cef19ae207478dd35e44e205ec5429e3b80979e9878f2336e1c2",
+        "schema_version": 1,
+        "sent_at": "2030-01-02T03:04:06Z",
+        "turn_id": "turn_v1_000000000000001"
+      },
+      "name": "submit-visible-text"
+    },
+    {
+      "envelope": {
+        "bridge_generation": "bridgegen_v1_0001",
+        "channel_binding_id": "binding_v1_000000000001",
+        "contract_version": "agent_stack.channel.v1",
+        "conversation_id": "conv_v1_0000000000000001",
+        "gateway_turn_id": "gturn_v1_000000001",
+        "ingress_id": "ingress_v1_cancel_000001",
+        "kind": "turn.cancel",
+        "payload": {
+          "reason": "user_requested",
+          "target_gateway_generation": "gatewaygen_v1_0001"
+        },
+        "payload_digest": "sha256:3264f907949ff2307355871008e2d90c2f8dbfa921c35b661195c0b2d78ab168",
+        "schema_version": 1,
+        "sent_at": "2030-01-02T03:04:07Z",
+        "turn_id": "turn_v1_000000000000001"
+      },
+      "name": "cancel-accepted-turn"
+    },
+    {
+      "envelope": {
+        "bridge_generation": "bridgegen_v1_0001",
+        "channel_binding_id": "binding_v1_000000000001",
+        "contract_version": "agent_stack.channel.v1",
+        "conversation_id": "conv_v1_0000000000000001",
+        "gateway_turn_id": "gturn_v1_000000001",
+        "ingress_id": "ingress_v1_ack_00000010",
+        "kind": "event.ack",
+        "payload": {
+          "highest_contiguous_gateway_sequence": 10
+        },
+        "payload_digest": "sha256:d2d5200338046caa4369c82776abd186353e96b282f1b2c6aaf678085fc161cb",
+        "schema_version": 1,
+        "sent_at": "2030-01-02T03:04:08Z",
+        "turn_id": "turn_v1_000000000000001"
+      },
+      "name": "ack-highest-contiguous-event"
+    }
+  ],
+  "contract_version": "agent_stack.channel.v1",
+  "document_type": "envelopes",
+  "fixture_schema_version": 1,
+  "receipt_examples": [
+    {
+      "envelope": {
+        "bridge_generation": "bridgegen_v1_0001",
+        "channel_binding_id": "binding_v1_000000000001",
+        "contract_version": "agent_stack.channel.v1",
+        "conversation_id": "conv_v1_0000000000000001",
+        "emitted_at": "2030-01-02T03:04:10Z",
+        "hermes_session_id": "hermes_v1_original_0001",
+        "ingress_id": "ingress_v1_bind_000001",
+        "kind": "conversation.bound",
+        "payload": {
+          "binding_version": 1,
+          "created": true
+        },
+        "payload_digest": "sha256:d2271573a57858b66847ca33f22fb313a123d6222c74ac6e33d55ae61180868f",
+        "schema_version": 1
+      },
+      "name": "bind-receipt"
+    }
+  ],
+  "turn_traces": [
+    {
+      "events": [
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:01Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 1,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "turn.accepted",
+          "payload": {
+            "queued_at": "2030-01-02T03:05:01Z",
+            "state": "accepted"
+          },
+          "payload_digest": "sha256:0fd13fd14edc45b26e4d60ad9a2c066ba8c8ac9603deb8a0388f02e4e286689f",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:02Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 2,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "turn.started",
+          "payload": {
+            "started_at": "2030-01-02T03:05:02Z",
+            "state": "running"
+          },
+          "payload_digest": "sha256:e249cc9c1d0924d1da9d6f9027cee0209036109ff51309776ba4429bb1d67e2e",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:03Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 3,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "turn.activity",
+          "payload": {
+            "phase": "searching",
+            "title": "Searching…"
+          },
+          "payload_digest": "sha256:7b2a12a5db44058f8dfeea0c6003fe32eef17436ac077a80e1fbcb43ecf06815",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:04Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 4,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "turn.text.delta",
+          "payload": {
+            "assistant_message_id": "message_assistant_v1_0001",
+            "content_length_utf8": 17,
+            "content_offset_utf8": 0,
+            "text": "Fixture response."
+          },
+          "payload_digest": "sha256:eeb5817a747c998ac12ff79758abc5d232324416880b6f1ca335accb84e342f1",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:05Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 5,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "turn.text.checkpoint",
+          "payload": {
+            "assistant_message_id": "message_assistant_v1_0001",
+            "content_length_utf8": 17,
+            "transcript_checkpointed": true,
+            "visible_text": "Fixture response."
+          },
+          "payload_digest": "sha256:eb2acf2f18bd4259d9b2414a186047f2277f57b8db8db36966b5dc8a1ac5d7b2",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:06Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 6,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "turn.approval.required",
+          "payload": {
+            "action_hint": "Approve from an authorized Hermes surface.",
+            "approval_id": "approval_v1_000000001",
+            "category": "external_side_effect",
+            "expires_at": "2030-01-02T03:15:06Z",
+            "response_supported": false,
+            "state": "approval_required",
+            "title": "Approval required"
+          },
+          "payload_digest": "sha256:29c313ee3754c6b570c69b86b458a3c1199c0e4fba683674e2c09dedc10114bb",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:07Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 7,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "turn.resumed",
+          "payload": {
+            "approval_resolution": "approved_out_of_band",
+            "resumed_at": "2030-01-02T03:05:07Z",
+            "state": "running"
+          },
+          "payload_digest": "sha256:f50b037e6b0ce302caf1dfdfc647cb72c9625a1402a91f45ef9408fa915c0195",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:08Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 8,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_continuation_0002",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "conversation.advanced",
+          "payload": {
+            "binding_version": 2,
+            "cause": "compression_continuation",
+            "new_hermes_session_id": "hermes_v1_continuation_0002",
+            "previous_hermes_session_id": "hermes_v1_original_0001"
+          },
+          "payload_digest": "sha256:ce490d47d2c04b93c8337c216521f15df8829268eaf6d871e3095a5edd904e7a",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:09Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 9,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_continuation_0002",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "turn.delivery_error",
+          "payload": {
+            "error_code": "gateway_unavailable",
+            "retryable": true,
+            "safe_message": "Notification delivery is delayed; the transcript remains available.",
+            "terminal": false
+          },
+          "payload_digest": "sha256:ba9eb2e996280cbf2952ed7c3137029fe2003096823f2e843186b3fd6edd2e86",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:05:10Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 10,
+          "gateway_turn_id": "gturn_v1_000000001",
+          "hermes_session_id": "hermes_v1_continuation_0002",
+          "ingress_id": "ingress_v1_submit_000001",
+          "kind": "turn.completed",
+          "payload": {
+            "assistant_message_id": "message_assistant_v1_0001",
+            "completed_at": "2030-01-02T03:05:10Z",
+            "content_length_utf8": 17,
+            "finish_reason": "completed",
+            "state": "succeeded"
+          },
+          "payload_digest": "sha256:3079bf90ccf3a682d622f47d30c644a723c3d7dbcfce260e10d754c6b4ef2b75",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000001"
+        }
+      ],
+      "name": "success-with-safe-activity-approval-continuation-and-delivery-warning",
+      "terminal_kind": "turn.completed"
+    },
+    {
+      "events": [
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:06:01Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 1,
+          "gateway_turn_id": "gturn_v1_000000002",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000002",
+          "kind": "turn.accepted",
+          "payload": {
+            "queued_at": "2030-01-02T03:06:01Z",
+            "state": "accepted"
+          },
+          "payload_digest": "sha256:a9e64b6926874b0c99d8d7f4f39491de78a6799fbfbf3c793eebd8f508ebaf8e",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000002"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:06:02Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 2,
+          "gateway_turn_id": "gturn_v1_000000002",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000002",
+          "kind": "turn.started",
+          "payload": {
+            "started_at": "2030-01-02T03:06:02Z",
+            "state": "running"
+          },
+          "payload_digest": "sha256:11107621fa3087f7a42f5ea73e6967518bb12dd53e2d0f04f79c50c31d013188",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000002"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:06:03Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 3,
+          "gateway_turn_id": "gturn_v1_000000002",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000002",
+          "kind": "turn.failed",
+          "payload": {
+            "completed_at": "2030-01-02T03:06:03Z",
+            "error_code": "execution_failed",
+            "finish_reason": "execution_failed",
+            "retryable": false,
+            "state": "failed"
+          },
+          "payload_digest": "sha256:3b058dc0b8847dd1e21bfa6c893545257c55cca40bcb2f40a8b39cad0cb6864b",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000002"
+        }
+      ],
+      "name": "terminal-execution-failure",
+      "terminal_kind": "turn.failed"
+    },
+    {
+      "events": [
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:07:01Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 1,
+          "gateway_turn_id": "gturn_v1_000000003",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000003",
+          "kind": "turn.accepted",
+          "payload": {
+            "queued_at": "2030-01-02T03:07:01Z",
+            "state": "accepted"
+          },
+          "payload_digest": "sha256:a4049f4ba931c805a6e9a1b6c6097267f355b357d93a46f220a74760e67e0a79",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000003"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:07:02Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 2,
+          "gateway_turn_id": "gturn_v1_000000003",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000003",
+          "kind": "turn.started",
+          "payload": {
+            "started_at": "2030-01-02T03:07:02Z",
+            "state": "running"
+          },
+          "payload_digest": "sha256:7818553fbde9d08d113c3a4d02225568c282786a662c872a330ba0e53c92d88a",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000003"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:07:03Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 3,
+          "gateway_turn_id": "gturn_v1_000000003",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000003",
+          "kind": "turn.cancel_requested",
+          "payload": {
+            "requested_at": "2030-01-02T03:07:03Z",
+            "state": "cancel_requested"
+          },
+          "payload_digest": "sha256:dc84703bb964957f5aa9b5e55102cc3a96376a47b4926b021cd91efa11d6ba2d",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000003"
+        },
+        {
+          "channel_binding_id": "binding_v1_000000000001",
+          "contract_version": "agent_stack.channel.v1",
+          "conversation_id": "conv_v1_0000000000000001",
+          "emitted_at": "2030-01-02T03:07:04Z",
+          "gateway_generation": "gatewaygen_v1_0001",
+          "gateway_sequence": 4,
+          "gateway_turn_id": "gturn_v1_000000003",
+          "hermes_session_id": "hermes_v1_original_0001",
+          "ingress_id": "ingress_v1_submit_000003",
+          "kind": "turn.cancelled",
+          "payload": {
+            "completed_at": "2030-01-02T03:07:04Z",
+            "content_length_utf8": 0,
+            "finish_reason": "user_requested",
+            "state": "cancelled"
+          },
+          "payload_digest": "sha256:5b35d1e8a19df38e184f12f31a9a3971db88e6c1246c99194a943386fa63c675",
+          "schema_version": 1,
+          "source_platform": "agent_stack",
+          "source_surface": "ios",
+          "turn_id": "turn_v1_000000000000003"
+        }
+      ],
+      "name": "cancel-wins-race",
+      "terminal_kind": "turn.cancelled"
+    }
+  ]
+}
