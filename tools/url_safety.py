@@ -10,6 +10,7 @@ re-apply the policy at TCP connect and dial the validated IP while preserving Ho
 bypass is mitigated by response hooks re-validating each target (``redirect_target_from_response``).
 """
 
+import importlib
 import ipaddress
 import logging
 import os
@@ -125,6 +126,9 @@ _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 # answer an IPv4 name (on the reporting macOS host, fake-IP TUN DNS returns it alongside the
 # plain address). ``ip.ipv4_mapped`` does not read it; ``_embedded_ipv4`` handles it explicitly.
 _IPV4_TRANSLATED_NETWORK = ipaddress.ip_network("::ffff:0:0:0/96")
+_IPV4_COMPATIBLE_NETWORK = ipaddress.ip_network("::/96")
+_NAT64_WELL_KNOWN_NETWORK = ipaddress.ip_network("64:ff9b::/96")
+_NAT64_LOCAL_USE_NETWORK = ipaddress.ip_network("64:ff9b:1::/48")
 
 # Address classes a ``security.fake_ip_ranges`` declaration can never excuse: a local proxy owns
 # none of them, and a declaration is trusted like ``allow_private_urls`` for whatever it names,
@@ -247,39 +251,64 @@ def _getaddrinfo(hostname: str, port: Optional[int] = None):
     return socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
 
 
+def _embedded_ipv4s(ip: _IPAddress) -> tuple[ipaddress.IPv4Address, ...]:
+    """IPv4 destinations carried by an IPv6 transition address.
+
+    A global-looking IPv6 literal can still route to IPv4 loopback/private space through NAT64,
+    6to4, Teredo, or the older compatible/translated forms. Classify the carried destinations too;
+    otherwise ``64:ff9b::7f00:1`` is a loopback bypass despite the outer address being global.
+    """
+    if not isinstance(ip, ipaddress.IPv6Address):
+        return ()
+    if ip.ipv4_mapped is not None:
+        return (ip.ipv4_mapped,)
+    transition_networks = (
+        _IPV4_TRANSLATED_NETWORK,
+        _NAT64_WELL_KNOWN_NETWORK,
+        _NAT64_LOCAL_USE_NETWORK,
+    )
+    if any(ip in network for network in transition_networks):
+        return (ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF),)
+    if ip in _IPV4_COMPATIBLE_NETWORK and int(ip) > 0xFFFF:
+        return (ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF),)
+    if ip.sixtofour is not None:
+        return (ip.sixtofour,)
+    if ip.teredo is not None:
+        return tuple(ip.teredo)
+    return ()
+
+
 def _embedded_ipv4(ip: _IPAddress) -> _IPAddress:
-    """The IPv4 address an IPv6 wrapper stands for — IPv4-mapped (``::ffff:x.x.x.x``) or
-    IPv4-translated (``::ffff:0:x.x.x.x``); *ip* unchanged otherwise. ``ipaddress`` reads both
-    wrappers as distinct IPv6 addresses, so every classification must see through them, or a
-    resolver's sentinel / a cloud-metadata answer arrives as unrelated IPv6 space."""
-    if isinstance(ip, ipaddress.IPv6Address):
-        if ip.ipv4_mapped is not None:
-            return ip.ipv4_mapped
-        if ip in _IPV4_TRANSLATED_NETWORK:
-            return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
-    return ip
+    """First carried IPv4 destination, or *ip* when this is not a transition address."""
+    embedded = _embedded_ipv4s(ip)
+    return embedded[0] if embedded else ip
 
 
 def _is_always_blocked_ip(ip: _IPAddress) -> bool:
-    ip = _embedded_ipv4(ip)
-    return ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS)
+    candidates = (ip, *_embedded_ipv4s(ip))
+    return any(
+        candidate in _ALWAYS_BLOCKED_IPS
+        or any(candidate in net for net in _ALWAYS_BLOCKED_NETWORKS)
+        for candidate in candidates
+    )
 
 
 def _is_declared_fake_ip(ip: _IPAddress) -> bool:
     """True when *ip* falls in a block declared in ``security.fake_ip_ranges``. The dial still goes
     to the local proxy, which resolves and connects to the real target, so a declared block grants
     no reach an attacker lacks through the proxy's own DNS; undeclared ranges keep the private verdict."""
-    ip = _embedded_ipv4(ip)
-    return any(ip in net for net in _global_fake_ip_ranges())
+    return any(
+        any(candidate in net for net in _global_fake_ip_ranges())
+        for candidate in (ip, *_embedded_ipv4s(ip))
+    )
 
 
 def _is_blocked_ip(ip: _IPAddress) -> bool:
     """Return True if the IP should be blocked for SSRF protection."""
-    # IPv4-wrapped IPv6 (mapped ``::ffff:x.x.x.x`` or translated ``::ffff:0:x.x.x.x``) is
-    # classified by its embedded IPv4.
-    ip = _embedded_ipv4(ip)
-    return (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-            or ip.is_multicast or ip.is_unspecified or ip in _CGNAT_NETWORK)
+    def blocked(candidate: _IPAddress) -> bool:
+        return not candidate.is_global or candidate.is_multicast or candidate in _CGNAT_NETWORK
+
+    return blocked(ip) or any(blocked(candidate) for candidate in _embedded_ipv4s(ip))
 
 
 def is_always_blocked_url(url: str) -> bool:
@@ -336,7 +365,7 @@ def _resolved_ip_block_reason(ip: _IPAddress, allow_private: bool) -> Optional[s
     return None
 
 
-def is_safe_url(url: str) -> bool:
+def is_safe_url(url: str, *, proxy_configured: Optional[bool] = None) -> bool:
     """True if the URL target is not a private/internal address. Resolves the hostname and checks
     every answer; fails closed on DNS errors and unexpected exceptions. ``allow_private_urls``
     skips private-IP blocking, but cloud metadata endpoints remain blocked regardless."""
@@ -348,6 +377,10 @@ def is_safe_url(url: str) -> bool:
             logger.warning("Blocked request — unsupported URL scheme: %s", scheme or "<empty>")
             return False
         if not hostname:
+            return False
+        port = parsed.port
+        if port is not None and not 1 <= port <= 65535:
+            logger.warning("Blocked request — invalid destination port: %s", port)
             return False
 
         # Metadata hostnames are blocked BEFORE consulting the toggle.
@@ -364,7 +397,8 @@ def is_safe_url(url: str) -> bool:
             # configured, delegate resolution to it (metadata hostnames were already
             # rejected above). Literal IPs need no DNS, so a failure on one is not a
             # proxy symptom — keep them fail-closed.
-            if _parse_ip(hostname) is None and _proxy_is_configured():
+            proxy_active = _proxy_is_configured() if proxy_configured is None else proxy_configured
+            if _parse_ip(hostname) is None and proxy_active:
                 logger.debug(
                     "DNS resolution failed for %s — proxy configured, allowing through for proxy-side resolution",
                     hostname)
@@ -403,6 +437,10 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
     """Resolve and validate *host* at TCP-connect time; return dialable IP strings. Closes the
     DNS-rebinding gap between pre-flight validation and connect for direct httpx clients. The
     result is capped at ``_MAX_SSRF_CONNECT_IPS``, but EVERY answer is validated."""
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise SSRFConnectionBlocked(f"Blocked request with invalid destination port: {port!r}")
+    if scheme not in _HTTP_SCHEMES:
+        raise SSRFConnectionBlocked(f"Blocked request with unsupported URL scheme: {scheme!r}")
     hostname = _normalize_hostname(host)
     if not hostname:
         raise SSRFConnectionBlocked("Blocked request with empty hostname")
@@ -443,9 +481,15 @@ class _SSRFGuardedBackendBase:
         return _resolved_http_connect_ips(host, port, scheme)
 
     @staticmethod
-    def _connect_errors() -> tuple:
-        import httpcore
-        return (httpcore.ConnectError, httpcore.ConnectTimeout)
+    def _connect_errors() -> tuple[type[Exception], ...]:
+        errors: list[type[Exception]] = [OSError]
+        for module_name in ("httpcore", "httpcore2"):
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                continue
+            errors.extend((module.ConnectError, module.ConnectTimeout))
+        return tuple(errors)
 
     @staticmethod
     def _no_usable_ips(host: str, last_exc: Exception | None) -> Exception:
@@ -458,9 +502,11 @@ class _SSRFGuardedBackendBase:
 
 
 class _SSRFGuardedAsyncNetworkBackend(_SSRFGuardedBackendBase):
-    def __init__(self, schemes_by_origin_var: Any):
-        from httpcore._backends.auto import AutoBackend
-        super().__init__(AutoBackend(), schemes_by_origin_var)
+    def __init__(self, schemes_by_origin_var: Any, backend: Any = None):
+        if backend is None:
+            from httpcore._backends.auto import AutoBackend
+            backend = AutoBackend()
+        super().__init__(backend, schemes_by_origin_var)
 
     async def connect_tcp(self, host: str, port: int, timeout: float | None = None,
                           local_address: str | None = None, socket_options: Any = None) -> Any:
@@ -481,9 +527,11 @@ class _SSRFGuardedAsyncNetworkBackend(_SSRFGuardedBackendBase):
 
 
 class _SSRFGuardedNetworkBackend(_SSRFGuardedBackendBase):
-    def __init__(self, schemes_by_origin_var: Any):
-        from httpcore._backends.sync import SyncBackend
-        super().__init__(SyncBackend(), schemes_by_origin_var)
+    def __init__(self, schemes_by_origin_var: Any, backend: Any = None):
+        if backend is None:
+            from httpcore._backends.sync import SyncBackend
+            backend = SyncBackend()
+        super().__init__(backend, schemes_by_origin_var)
 
     def connect_tcp(self, host: str, port: int, timeout: float | None = None,
                     local_address: str | None = None, socket_options: Any = None) -> Any:
@@ -524,9 +572,14 @@ def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any,
     label = "async httpx transport" if is_async else "httpx transport"
     pool = state.get("_pool")
     if pool is None or not hasattr(pool, "_network_backend"):
+        inner = state.get("_inner")
+        if inner is not None:
+            _install_ssrf_guard_on_transport(inner, schemes_by_origin_var, is_async=is_async)
+            state["_hermes_ssrf_guarded"] = True
+            return
         raise SSRFConnectionBlocked(f"Unsupported {label} cannot be made SSRF-safe")
     backend_cls = _SSRFGuardedAsyncNetworkBackend if is_async else _SSRFGuardedNetworkBackend
-    pool._network_backend = backend_cls(schemes_by_origin_var)
+    pool._network_backend = backend_cls(schemes_by_origin_var, backend=pool._network_backend)
     method_name = "handle_async_request" if is_async else "handle_request"
     handle = getattr(transport, method_name, None)
     if handle is None:
@@ -551,22 +604,88 @@ def _install_ssrf_guard_on_client(client: Any, *, is_async: bool = False) -> Non
         getattr(client, "__dict__", {}).get("_transport"), contextvars.ContextVar(var_name), is_async=is_async)
 
 
+def install_ssrf_guard_on_transport(transport: Any, *, is_async: bool = False) -> Any:
+    """Install the connect-time guard on an httpx/httpx2 transport and return it.
+
+    The wrapper delegates to the transport's existing backend instead of importing one httpcore
+    flavour, so MCP's separately packaged ``httpx2``/``httpcore2`` stack keeps its native stream
+    types and cancellation semantics.
+    """
+    import contextvars
+    _install_ssrf_guard_on_transport(
+        transport, contextvars.ContextVar(f"hermes_ssrf_origin_{id(transport)}"), is_async=is_async)
+    return transport
+
+
+def _guard_request_target(request: Any, *, proxy_configured: bool = False) -> None:
+    """Validate every request target, including redirects and proxied requests."""
+    url = request.url
+    if proxy_configured:
+        if not is_safe_url(str(url), proxy_configured=True):
+            raise SSRFConnectionBlocked("Blocked private/internal or otherwise unsafe proxied destination")
+        return
+    host, scheme = url.host, url.scheme
+    port = url.port if url.port is not None else {"http": 80, "https": 443}.get(scheme)
+    if not host or port is None:
+        raise SSRFConnectionBlocked("Blocked request with no network destination")
+    _resolved_http_connect_ips(host, port, scheme)
+
+
+def ssrf_safe_event_hooks(
+    event_hooks: Any = None, *, is_async: bool = False, proxy_configured: bool = False
+) -> dict[str, list]:
+    """Merge a fail-closed target check ahead of existing httpx/httpx2 request hooks."""
+    hooks = {name: list(callbacks) for name, callbacks in dict(event_hooks or {}).items()}
+
+    async def async_guard(request: Any) -> None:
+        await asyncio.to_thread(_guard_request_target, request, proxy_configured=proxy_configured)
+
+    def sync_guard(request: Any) -> None:
+        _guard_request_target(request, proxy_configured=proxy_configured)
+
+    guard = async_guard if is_async else sync_guard
+    hooks["request"] = [guard, *hooks.get("request", [])]
+    return hooks
+
+
+def _client_proxy_configured(kwargs: dict[str, Any]) -> bool:
+    if kwargs.get("proxy") is not None or bool(kwargs.get("mounts")):
+        return True
+    return kwargs.get("trust_env", True) is not False and _proxy_is_configured()
+
+
+def create_ssrf_safe_async_client_for(httpx_module: Any, **kwargs: Any) -> Any:
+    """Create a guarded async client from ``httpx`` or the MCP SDK's ``httpx2`` module."""
+    proxy_configured = _client_proxy_configured(kwargs)
+    kwargs["event_hooks"] = ssrf_safe_event_hooks(
+        kwargs.get("event_hooks"), is_async=True, proxy_configured=proxy_configured)
+    client = httpx_module.AsyncClient(**kwargs)
+    _install_ssrf_guard_on_client(client, is_async=True)
+    return client
+
+
+def create_ssrf_safe_client_for(httpx_module: Any, **kwargs: Any) -> Any:
+    """Create a guarded sync client from an httpx-compatible module."""
+    proxy_configured = _client_proxy_configured(kwargs)
+    kwargs["event_hooks"] = ssrf_safe_event_hooks(
+        kwargs.get("event_hooks"), proxy_configured=proxy_configured)
+    client = httpx_module.Client(**kwargs)
+    _install_ssrf_guard_on_client(client)
+    return client
+
+
 def create_ssrf_safe_async_client(**kwargs: Any) -> Any:
     """``httpx.AsyncClient`` with connect-time SSRF validation: direct HTTP(S) connections are
     resolved, validated, and dialed by IP while the hostname is preserved for Host, SNI, and
-    certificate verification. Proxied requests delegate resolution to the proxy."""
+    certificate verification. Proxied requests are preflight-validated on every hop."""
     import httpx
-    client = httpx.AsyncClient(**kwargs)
-    _install_ssrf_guard_on_client(client, is_async=True)
-    return client
+    return create_ssrf_safe_async_client_for(httpx, **kwargs)
 
 
 def create_ssrf_safe_client(**kwargs: Any) -> Any:
     """Create an ``httpx.Client`` with connect-time SSRF validation."""
     import httpx
-    client = httpx.Client(**kwargs)
-    _install_ssrf_guard_on_client(client)
-    return client
+    return create_ssrf_safe_client_for(httpx, **kwargs)
 
 
 def redirect_target_from_response(response: Any) -> Optional[str]:

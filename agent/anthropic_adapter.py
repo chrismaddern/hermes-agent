@@ -394,6 +394,10 @@ def _base_client_kwargs(base_url, timeout) -> tuple[str, dict[str, Any]]:
         kwargs["base_url"] = normalized
         if _is_azure_anthropic_endpoint(normalized) and "api-version" not in normalized:
             kwargs["default_query"] = {"api-version": "2025-04-15"}
+    from agent.process_bootstrap import build_keepalive_http_client
+    http_client = build_keepalive_http_client(normalized)
+    if http_client is not None:
+        kwargs["http_client"] = http_client
     return normalized, kwargs
 
 

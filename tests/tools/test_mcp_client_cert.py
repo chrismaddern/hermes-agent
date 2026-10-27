@@ -55,6 +55,7 @@ class _DummyTransport:
 
     def __init__(self, **kwargs):
         type(self).captured = dict(kwargs)
+        self._hermes_ssrf_guarded = True  # capture-only transport never opens a socket
 
     async def handle_async_request(self, request):  # pragma: no cover
         raise AssertionError("not dispatched in these tests")

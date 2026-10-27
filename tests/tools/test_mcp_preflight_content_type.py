@@ -31,6 +31,15 @@ import pytest
 
 from tools.mcp_tool import MCPServerTask
 from tools.mcp_tool_errors import NonMcpEndpointError
+from tools.url_safety import _reset_allow_private_cache
+
+
+@pytest.fixture(autouse=True)
+def _allow_local_fixture_server(monkeypatch):
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+    _reset_allow_private_cache()
+    yield
+    _reset_allow_private_cache()
 
 
 def _make_task(name: str = "probe_srv") -> MCPServerTask:

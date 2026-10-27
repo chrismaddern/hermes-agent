@@ -267,8 +267,8 @@ def close_shared_transports() -> int:
     return len(transports)
 
 
-def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False, verify: Any = True) -> Optional[Any]:
-    """httpx client for OpenAI SDK calls with env-only proxy policy (None on failure).
+def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False, verify: Any = True) -> Any:
+    """Build the guarded httpx client used for model SDK calls.
 
     Explicit no-proxy mounts disable httpx's ``trust_env`` path so macOS system
     proxies (which omit the ExceptionsList) are never applied. ``keepalive_expiry``
@@ -281,54 +281,56 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
     ``HTTPTransport`` through a ``_SharedTransport`` view, so N delegated children share one
     connection pool + SSL context. Async clients are never shared: an httpcore async pool is
     bound to the event loop that first used it. Proxy-backed clients keep httpx's own transport.
+    Construction fails closed: callers must never fall back to an unguarded SDK transport.
 
     See #12952, #54049.
     See #10933.
     """
-    try:
-        import httpx
-        proxy = _get_proxy_for_base_url(base_url)
-        limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=20.0)
-        timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)  # read=None for SSE streaming
-        transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
-        client_cls = httpx.AsyncClient if async_mode else httpx.Client
-        mounts = None
-        # Official Codex backend only: zstd request bodies when the stdlib codec exists (None otherwise).
-        from agent.codex_headers import codex_request_compression_hooks
-        hooks = codex_request_compression_hooks(base_url, async_mode=async_mode)
-        if hooks:
-            client_cls = functools.partial(client_cls, event_hooks=hooks)
-        if proxy is None:
-            happy_eyeballs = not async_mode and _uses_codex_cloud_transport(base_url)
-            # One pool serves every agent in the process, so its ceiling must cover a whole
-            # fan-out of concurrently streaming children. (Client-level ``limits`` never reach
-            # mounted transports — they used to run on httpx defaults, keepalive_expiry=5s.)
-            direct_limits = limits if async_mode else httpx.Limits(
-                max_keepalive_connections=50, max_connections=1000, keepalive_expiry=20.0,
-            )
+    import httpx
+    proxy = _get_proxy_for_base_url(base_url)
+    limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=20.0)
+    timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=10.0)  # read=None for SSE streaming
+    transport_cls = httpx.AsyncHTTPTransport if async_mode else httpx.HTTPTransport
+    client_cls = httpx.AsyncClient if async_mode else httpx.Client
+    mounts = None
+    # Official Codex backend only: zstd request bodies when the stdlib codec exists (None otherwise).
+    from agent.codex_headers import codex_request_compression_hooks
+    from tools.url_safety import install_ssrf_guard_on_transport, ssrf_safe_event_hooks
+    hooks = ssrf_safe_event_hooks(
+        codex_request_compression_hooks(base_url, async_mode=async_mode),
+        is_async=async_mode,
+        proxy_configured=proxy is not None,
+    )
+    client_cls = functools.partial(client_cls, event_hooks=hooks)
+    if proxy is None:
+        happy_eyeballs = not async_mode and _uses_codex_cloud_transport(base_url)
+        # One pool serves every agent in the process, so its ceiling must cover a whole
+        # fan-out of concurrently streaming children. (Client-level ``limits`` never reach
+        # mounted transports — they used to run on httpx defaults, keepalive_expiry=5s.)
+        direct_limits = limits if async_mode else httpx.Limits(
+            max_keepalive_connections=50, max_connections=1000, keepalive_expiry=20.0,
+        )
 
-            def _build_direct():
-                transport = transport_cls(verify=verify, limits=direct_limits)
-                # Async transports race natively (anyio happy_eyeballs_delay=0.25).
-                if happy_eyeballs:
-                    _enable_happy_eyeballs(transport)
-                return transport
+        def _build_direct():
+            transport = transport_cls(verify=verify, limits=direct_limits)
+            # Async transports race natively (anyio happy_eyeballs_delay=0.25).
+            if happy_eyeballs:
+                _enable_happy_eyeballs(transport)
+            return install_ssrf_guard_on_transport(transport, is_async=async_mode)
 
-            if async_mode:
-                mounts = {"http://": _build_direct(), "https://": _build_direct()}
-            else:
-                key = _shared_transport_key(base_url, verify, proxy)
-                view_cls = _shared_transport_cls()
-                mounts = {
-                    f"{scheme}://": view_cls(_get_shared_transport((scheme, *key), _build_direct))
-                    for scheme in ("http", "https")
-                }
-                # Default transport = the https view; otherwise httpx builds a third, never-used
-                # direct transport (pool + SSL context) per client.
-                return client_cls(limits=limits, timeout=timeout, transport=mounts["https://"], mounts=mounts)
-        return client_cls(limits=limits, timeout=timeout, proxy=proxy, mounts=mounts or None, verify=verify)
-    except Exception:
-        return None
+        if async_mode:
+            mounts = {"http://": _build_direct(), "https://": _build_direct()}
+        else:
+            key = _shared_transport_key(base_url, verify, proxy)
+            view_cls = _shared_transport_cls()
+            mounts = {
+                f"{scheme}://": view_cls(_get_shared_transport((scheme, *key), _build_direct))
+                for scheme in ("http", "https")
+            }
+            # Default transport = the https view; otherwise httpx builds a third, never-used
+            # direct transport (pool + SSL context) per client.
+            return client_cls(limits=limits, timeout=timeout, transport=mounts["https://"], mounts=mounts)
+    return client_cls(limits=limits, timeout=timeout, proxy=proxy, mounts=mounts or None, verify=verify)
 
 
 def _install_safe_stdio() -> None:

@@ -73,7 +73,11 @@ class TestBuildBearerHttpClient:
 
         client = build_bearer_http_client(provider)
         try:
-            hook = client.event_hooks["request"][0]
+            hook = next(
+                hook
+                for hook in client.event_hooks["request"]
+                if hook.__name__ == "_inject_auth"
+            )
             # Build a request with conflicting pre-set headers and verify
             # the hook strips them and installs the fresh bearer.
             req = httpx.Request(
@@ -122,7 +126,11 @@ class TestBuildBearerHttpClient:
 
         client = build_bearer_http_client(bad_provider)
         try:
-            hook = client.event_hooks["request"][0]
+            hook = next(
+                hook
+                for hook in client.event_hooks["request"]
+                if hook.__name__ == "_inject_auth"
+            )
             req = httpx.Request(
                 "POST", "https://example.com/v1/messages",
                 headers={

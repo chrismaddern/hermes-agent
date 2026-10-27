@@ -340,7 +340,9 @@ def build_bearer_http_client(
         else:
             request.headers["Authorization"] = f"Bearer {token}"
 
-    return httpx.Client(event_hooks={"request": [_inject_auth]}, **httpx_kwargs)
+    from tools.url_safety import create_ssrf_safe_client_for
+    return create_ssrf_safe_client_for(
+        httpx, event_hooks={"request": [_inject_auth]}, **httpx_kwargs)
 
 
 __all__ = [

@@ -6,6 +6,7 @@ shared underneath is the connection pool + SSL context, so a fan-out of N
 children no longer holds N TLS socket sets to the same provider.
 """
 
+import socket
 import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,6 +18,7 @@ import pytest
 from agent import process_bootstrap
 from agent.agent_runtime_helpers import _iter_pool_sockets, force_close_tcp_sockets
 from agent.process_bootstrap import build_keepalive_http_client
+from tools.url_safety import SSRFConnectionBlocked, _reset_allow_private_cache
 
 
 @pytest.fixture
@@ -46,7 +48,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def local_server():
+def local_server(monkeypatch):
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+    _reset_allow_private_cache()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -56,6 +60,7 @@ def local_server():
     finally:
         server.shutdown()
         server.server_close()
+        _reset_allow_private_cache()
 
 
 def _inner(client, scheme="https://"):
@@ -74,6 +79,101 @@ def test_same_identity_clients_share_transport_but_not_client(no_proxy_env):
     assert a._mounts is not b._mounts
     a.close()
     b.close()
+
+
+def test_model_client_blocks_private_destination_before_proxy_or_socket(no_proxy_env, monkeypatch):
+    monkeypatch.setattr(
+        "socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("127.0.0.1", 443))],
+    )
+    client = build_keepalive_http_client("https://model.example/v1")
+    try:
+        with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+            client.get("https://model.example/v1/models")
+    finally:
+        client.close()
+
+
+def test_model_client_blocks_dns_rebinding_at_connect(no_proxy_env, monkeypatch):
+    answers = iter(("93.184.216.34", "127.0.0.1"))
+
+    def resolve(_host, port, *_args, **_kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (next(answers), port))]
+
+    monkeypatch.setattr("socket.getaddrinfo", resolve)
+    client = build_keepalive_http_client("https://model.example/v1")
+    try:
+        with pytest.raises(SSRFConnectionBlocked, match="during connect"):
+            client.get("https://model.example/v1/models")
+    finally:
+        client.close()
+
+
+def test_model_client_allows_public_destination(no_proxy_env, monkeypatch):
+    import httpcore
+    from httpcore._backends.sync import SyncBackend
+
+    monkeypatch.setattr(
+        "socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+    attempts = []
+
+    def stop_before_network(
+        _backend, host, port, timeout=None, local_address=None, socket_options=None
+    ):
+        attempts.append((host, port))
+        raise httpcore.ConnectError("public destination reached the dial boundary")
+
+    monkeypatch.setattr(SyncBackend, "connect_tcp", stop_before_network)
+    client = build_keepalive_http_client("https://model.example/v1")
+    try:
+        with pytest.raises(httpx.ConnectError, match="dial boundary"):
+            client.get("https://model.example/v1/models")
+    finally:
+        client.close()
+    assert attempts == [("93.184.216.34", 443)]
+
+
+def test_model_client_guard_installation_failure_is_not_an_unguarded_fallback(
+    no_proxy_env, monkeypatch
+):
+    def refuse_guard(*_args, **_kwargs):
+        raise SSRFConnectionBlocked("guard unavailable")
+
+    monkeypatch.setattr(
+        "tools.url_safety.install_ssrf_guard_on_transport", refuse_guard
+    )
+
+    with pytest.raises(SSRFConnectionBlocked, match="guard unavailable"):
+        build_keepalive_http_client("https://model.example/v1")
+
+
+def test_model_client_proxy_path_still_rejects_private_target(no_proxy_env, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    monkeypatch.setattr(
+        "socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("10.0.0.8", 443))],
+    )
+    client = build_keepalive_http_client("https://model.example/v1")
+    try:
+        with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+            for hook in client._event_hooks["request"]:
+                hook(httpx.Request("GET", "https://model.example/v1/models"))
+    finally:
+        client.close()
+
+
+def test_model_client_proxy_allows_proxy_side_dns(no_proxy_env, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    monkeypatch.setattr("socket.getaddrinfo", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        socket.gaierror("direct DNS unavailable")))
+    client = build_keepalive_http_client("https://model.example/v1")
+    try:
+        for hook in client._event_hooks["request"]:
+            hook(httpx.Request("GET", "https://model.example/v1/models"))
+    finally:
+        client.close()
 
 
 def test_closing_one_client_leaves_sibling_functional(no_proxy_env, local_server):
@@ -120,7 +220,8 @@ def test_different_verify_or_proxy_get_different_transports(no_proxy_env, monkey
     # Codex cloud gets the happy-eyeballs backend, so it can't share a pool.
     assert _inner(codex) is not _inner(default)
     assert isinstance(
-        _inner(codex)._pool._network_backend, process_bootstrap._HappyEyeballsSyncBackend
+        _inner(codex)._pool._network_backend._backend,
+        process_bootstrap._HappyEyeballsSyncBackend,
     )
     for c in (default, insecure, with_ctx, with_ctx2, codex):
         c.close()

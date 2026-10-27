@@ -19,6 +19,7 @@ from tools.url_safety import (
     _is_blocked_ip,
     _global_allow_private_urls,
     _reset_allow_private_cache,
+    create_ssrf_safe_async_client_for,
 )
 
 import ipaddress
@@ -185,6 +186,29 @@ class TestSSRFGuardedHttpxClient:
             with pytest.raises(SSRFConnectionBlocked, match="metadata"):
                 _resolved_http_connect_ips("example.com", 80, "http")
 
+    @pytest.mark.parametrize("port", [0, -1, 65536, "443", None])
+    def test_connect_rejects_invalid_ports_before_dns(self, port):
+        with patch("socket.getaddrinfo") as resolver:
+            with pytest.raises(SSRFConnectionBlocked, match="port"):
+                _resolved_http_connect_ips("example.com", port, "https")
+        resolver.assert_not_called()
+
+    def test_proxy_preflight_rejects_zero_port(self):
+        with _resolves_to("93.184.216.34"):
+            assert is_safe_url("https://example.com:0/resource", proxy_configured=True) is False
+
+    @pytest.mark.asyncio
+    async def test_sdk_httpx2_client_gets_the_same_connect_guard(self):
+        import httpx2
+
+        client = create_ssrf_safe_async_client_for(httpx2, timeout=0.01)
+        try:
+            assert type(client._transport._pool._network_backend).__name__ == (
+                "_SSRFGuardedAsyncNetworkBackend"
+            )
+        finally:
+            await client.aclose()
+
 
     @pytest.mark.asyncio
     async def test_async_backend_blocks_unix_socket_connects(self):
@@ -235,6 +259,14 @@ class TestSSRFGuardedHttpxClient:
                 != "_SSRFGuardedAsyncNetworkBackend"
                 for transport in proxy_transports
             )
+            monkeypatch.setattr(
+                socket,
+                "getaddrinfo",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(socket.gaierror("proxy DNS only")),
+            )
+            await client.event_hooks["request"][0](
+                httpx.Request("GET", "https://public-via-proxy.example/resource")
+            )
         finally:
             await client.aclose()
 
@@ -255,6 +287,10 @@ class TestIsBlockedIp:
         "198.18.0.23",              # benchmark range
         "fd12::1",                  # IPv6 unique local
         "::ffff:169.254.169.254",   # IPv4-mapped IPv6 metadata
+        "64:ff9b::7f00:1",          # NAT64 wrapper around 127.0.0.1
+        "64:ff9b:1::c0a8:1",        # site-local NAT64 wrapper around 192.168.0.1
+        "2002:7f00:1::",            # 6to4 wrapper around 127.0.0.1
+        "::ffff:0:7f00:1",          # IPv4-translated wrapper around 127.0.0.1
     ])
     def test_blocked_ips(self, ip_str):
         ip = ipaddress.ip_address(ip_str)

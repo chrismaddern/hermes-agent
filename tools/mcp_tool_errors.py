@@ -301,7 +301,8 @@ def _make_redirect_header_stripper(httpx_mod, original_url, *, strict: bool = Fa
     origin = (original_url.scheme, original_url.host, original_url.port)
 
     def _build_client(**kwargs):
-        client = httpx_mod.AsyncClient(**kwargs)
+        from tools.url_safety import create_ssrf_safe_async_client_for
+        client = create_ssrf_safe_async_client_for(httpx_mod, **kwargs)
         base_build = getattr(type(client), "_build_redirect_request", None)
 
         def _build_redirect_request(request, response):

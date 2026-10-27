@@ -460,7 +460,11 @@ class MCPServerTransportMixin:
         # Same redirect boundary as the transport client too: httpx strips Authorization on a
         # cross-origin hop natively, but forwards every other configured header verbatim — under
         # strict_redirect_headers those must not leave the configured origin on the probe either.
-        probe_transport = _httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
+        from tools.url_safety import install_ssrf_guard_on_transport
+        probe_transport = install_ssrf_guard_on_transport(
+            _httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert)),
+            is_async=True,
+        )
         _build_client = _make_redirect_header_stripper(
             _httpx, _httpx.URL(url), strict=strict_redirect_headers,
             configured_header_names={key.lower() for key in probe_headers})
@@ -548,9 +552,14 @@ class MCPServerTransportMixin:
         # inert once a custom transport= is passed) and re-adds the proxy mounts that custom transport
         # would otherwise suppress. Client MUST come from the SDK's httpx (httpx2 on mcp >= 2.0).
         _httpx_mod = _core.sdk_httpx()
+        from tools.url_safety import create_ssrf_safe_async_client_for, install_ssrf_guard_on_transport
         def _sse_client_factory(headers=None, timeout=None, auth=None):
-            inner_transport = _httpx_mod.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
-            return _httpx_mod.AsyncClient(
+            inner_transport = install_ssrf_guard_on_transport(
+                _httpx_mod.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert)),
+                is_async=True,
+            )
+            return create_ssrf_safe_async_client_for(
+                _httpx_mod,
                 follow_redirects=True,
                 timeout=timeout if timeout is not None else _httpx_mod.Timeout(30.0, read=300.0),
                 transport=_make_mcp_body_cap_transport(_httpx_mod, inner_transport),
@@ -578,7 +587,11 @@ class MCPServerTransportMixin:
             httpx, httpx.URL(url), strict=strict_cfg_headers, configured_header_names=configured_header_names)
         # verify/cert live on the inner transport: a custom transport= makes client-level TLS kwargs
         # inert — and suppresses httpx's own proxy auto-detection, hence the explicit mounts=.
-        inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
+        from tools.url_safety import install_ssrf_guard_on_transport
+        inner_transport = install_ssrf_guard_on_transport(
+            httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert)),
+            is_async=True,
+        )
         client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
                                "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection)]},
