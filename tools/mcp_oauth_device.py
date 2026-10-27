@@ -215,12 +215,14 @@ async def login_device(name, server_url, oauth_config):
                                      client_metadata=_build_client_metadata(cfg),
                                      token_user_agent=cfg.get("user_agent"))
     httpx = sdk_httpx()
-    from tools.url_safety import create_ssrf_safe_async_client_for
+    from tools.url_safety import SSRFConnectionBlocked, create_ssrf_safe_async_client_for
     try:
         async with create_ssrf_safe_async_client_for(httpx, timeout=10, follow_redirects=False) as client:
             await _discover(client, provider)
             await _register(client, provider, cfg)
             tokens = await _authorize(client, provider, cfg)
+    except SSRFConnectionBlocked as exc:
+        raise RuntimeError(f"Device OAuth destination blocked: {exc}") from None
     except (ValueError, TypeError, KeyError):
         raise RuntimeError("Device OAuth response has invalid fields") from None
     except httpx.HTTPError:

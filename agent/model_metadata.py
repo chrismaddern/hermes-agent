@@ -718,7 +718,6 @@ def _localhost_to_ipv4(url: str) -> str:
 
 def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     """Probe known endpoints: "ollama", "lm-studio", "vllm", "llamacpp", or None (TTL-cached)."""
-    import httpx
     # IPv4-resolve BEFORE deriving server/LM Studio URLs and the cache lookup, so localhost and 127.0.0.1 share a cache entry.
     normalized = _localhost_to_ipv4(_normalize_base_url(base_url))
     # A hosted provider (api.openai.com, api.anthropic.com, ...) never runs Ollama/LM Studio/llama.cpp/vLLM:
@@ -750,7 +749,7 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     )
     result: Optional[str] = None
     try:
-        with httpx.Client(timeout=2.0, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(base_url)) as client:
+        with model_metadata_http.guarded_client(timeout=2.0, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(base_url)) as client:
             for name, urls, check in waterfall:
                 try:
                     for url in urls:
@@ -1411,9 +1410,8 @@ def _model_id_matches(candidate_id: str, lookup_model: str) -> bool:
 
 def _ollama_show(server_url: str, api_key: str, bare_model: str, timeout: float = 3.0, *, note_blackhole: bool = False) -> Optional[dict[str, Any]]:
     """Ollama ``/api/show`` JSON for ``bare_model``, or None on any failure (``note_blackhole``: connect timeouts condemn the host)."""
-    import httpx
     try:
-        with httpx.Client(timeout=timeout, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(server_url)) as client:
+        with model_metadata_http.guarded_client(timeout=timeout, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(server_url)) as client:
             resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
             return resp.json() if resp.status_code == 200 else None
     except Exception as exc:
@@ -1590,7 +1588,6 @@ def _openai_models_list_context(client, server_url: str, model: str) -> Optional
 
 def _query_local_context_length_uncached(model: str, base_url: str, api_key: str = "") -> Optional[int]:
     """Query a local server for the model's context length."""
-    import httpx
     model = _strip_provider_prefix(model)
     server_url = _server_root(base_url)
     lmstudio_url = _localhost_to_ipv4(_lmstudio_server_root(base_url))
@@ -1621,7 +1618,7 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
     }.get(server_type)
     probes = ([typed] if typed else []) + [_model_detail_ctx, lambda client: _openai_models_list_context(client, server_url, model)]
     try:
-        with httpx.Client(timeout=3.0, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(base_url)) as client:
+        with model_metadata_http.guarded_client(timeout=3.0, headers=_auth_headers(api_key), verify=model_metadata_http.resolve_verify(base_url)) as client:
             return next((ctx for ctx in (probe(client) for probe in probes) if ctx is not None), None)
     except Exception as exc:
         _note_if_connect_timeout(exc, server_url)

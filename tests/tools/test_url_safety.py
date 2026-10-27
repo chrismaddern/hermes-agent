@@ -202,6 +202,23 @@ class TestSSRFGuardedHttpxClient:
         with _resolves_to("93.184.216.34"):
             assert is_safe_url("https://example.com:0/resource", proxy_configured=True) is False
 
+    def test_client_rejects_reuse_after_outbound_policy_changes(self, monkeypatch):
+        monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+        _reset_allow_private_cache()
+        with _resolves_to("93.184.216.34"):
+            client = create_ssrf_safe_client_for(httpx)
+
+        monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "false")
+        _reset_allow_private_cache()
+        try:
+            with _resolves_to("93.184.216.34"), pytest.raises(
+                SSRFConnectionBlocked, match="policy changed"
+            ):
+                for hook in client._event_hooks["request"]:
+                    hook(httpx.Request("GET", "https://example.com/models"))
+        finally:
+            client.close()
+
     @pytest.mark.asyncio
     async def test_sdk_httpx2_client_gets_the_same_connect_guard(self):
         import httpx2
@@ -576,7 +593,12 @@ class TestAllowPrivateUrlsIntegration:
 
     @pytest.mark.parametrize("ip, url", [
         ("fd00:ec2::254", "http://[fd00:ec2::254]/latest/"),          # AWS IPv6 IMDS
+        ("fd00:ec2::23", "http://[fd00:ec2::23]/v1/credentials"),     # EKS Pod Identity IPv6
+        ("fd20:ce::254", "http://[fd20:ce::254]/computeMetadata/v1/"),  # GCP IPv6 IMDS
+        ("169.254.170.23", "http://169.254.170.23/v1/credentials"),   # EKS Pod Identity IPv4
+        ("168.63.129.16", "http://168.63.129.16/machine/?comp=goalstate"),  # Azure WireServer
         ("100.100.100.200", "http://100.100.100.200/latest/meta-data/"),  # Alibaba
+        ("192.0.0.192", "http://192.0.0.192/opc/v1/instance/"),       # Oracle legacy IMDS
     ])
     def test_metadata_ip_blocked_even_with_toggle(self, monkeypatch, ip, url):
         monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
@@ -815,5 +837,17 @@ class TestDeclaredFakeIpSentinelRanges:
                 assert is_safe_url("https://example.com/") is False
             with _resolves_to("198.18.1.125"):  # the legitimate sibling declaration still works
                 assert is_safe_url("https://example.com/") is True
+        finally:
+            _reset_allow_private_cache()
+
+    def test_declared_transition_range_cannot_excuse_embedded_loopback(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config",
+            lambda: {"security": {"fake_ip_ranges": ["64:ff9b::/96"]}},
+        )
+        _reset_allow_private_cache()
+        try:
+            with _resolves_to("64:ff9b::7f00:1"):
+                assert is_safe_url("https://example.com/") is False
         finally:
             _reset_allow_private_cache()

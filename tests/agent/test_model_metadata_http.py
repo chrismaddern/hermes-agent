@@ -7,10 +7,13 @@ from threading import Thread
 import pytest
 
 from agent import model_metadata, model_metadata_http
+from tools.url_safety import _reset_allow_private_cache
 
 
 @pytest.fixture
-def servers():
+def servers(monkeypatch):
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+    _reset_allow_private_cache()
     active = []
 
     def start(handler):
@@ -26,6 +29,7 @@ def servers():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+    _reset_allow_private_cache()
 
 
 def test_redirect_credentials_and_proxy_routing_are_preserved(servers, monkeypatch):
@@ -63,8 +67,18 @@ def test_redirect_credentials_and_proxy_routing_are_preserved(servers, monkeypat
     # cannot answer without the configured proxy. No external network is used.
     monkeypatch.setenv("HTTP_PROXY", source_url)
     monkeypatch.setenv("NO_PROXY", "")
-    assert model_metadata_http.get("http://probe.invalid/models").status_code == 200
-    assert seen[-1][0] == "http://probe.invalid/models"
+    import socket
+    real_getaddrinfo = socket.getaddrinfo
+
+    def resolve(host, port, *args, **kwargs):
+        if host == "probe.public.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    assert model_metadata_http.get("http://probe.public.test/models").status_code == 200
+    assert seen[-1][0] == "http://93.184.216.34/models"
+    assert seen[-1][1]["Host"] == "probe.public.test"
 
 
 @pytest.mark.parametrize("status", [401, 403, 404])

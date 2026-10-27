@@ -22,6 +22,14 @@ def resolve_verify(base_url: str = ""):
     )
 
 
+def guarded_client(**kwargs):
+    """Guarded httpx client shared by every model-metadata probe."""
+    import httpx
+    from tools.url_safety import create_ssrf_safe_client_for
+
+    return create_ssrf_safe_client_for(httpx, **kwargs)
+
+
 @contextmanager
 def stream(url: str, *, headers=None, params=None, timeout=10.0, verify=None):
     import httpx
@@ -39,7 +47,7 @@ def stream(url: str, *, headers=None, params=None, timeout=10.0, verify=None):
     if isinstance(timeout, tuple):
         connect, read = timeout
         timeout = httpx.Timeout(read, connect=connect)
-    with httpx.Client(
+    with guarded_client(
         verify=resolve_verify() if verify is None else verify,
         timeout=timeout,
         follow_redirects=True,

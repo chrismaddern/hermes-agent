@@ -9,6 +9,7 @@ rewritten at the final write boundary.
 """
 
 from contextvars import ContextVar
+import importlib
 from types import MethodType
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -19,6 +20,17 @@ _current_target: ContextVar[_Target | None] = ContextVar(
     "hermes_bedrock_outbound_target", default=None
 )
 _pool_classes: dict[str, Any] | None = None
+
+
+def _connect_errors() -> tuple[type[Exception], ...]:
+    """Socket/connect failures raised by botocore's optional urllib3 dependency."""
+    errors: list[type[Exception]] = [OSError]
+    try:
+        module = importlib.import_module("urllib3.exceptions")
+    except ImportError:
+        return tuple(errors)
+    errors.extend((module.ConnectTimeoutError, module.NewConnectionError))
+    return tuple(errors)
 
 
 def _target_from_url(url: str) -> _Target:
@@ -90,7 +102,7 @@ def _guarded_pool_classes() -> dict[str, Any]:
                 try:
                     self._dns_host = ip
                     return super()._new_conn()
-                except OSError as exc:
+                except _connect_errors() as exc:
                     last_error = exc
                 finally:
                     self._dns_host = original_host
@@ -141,7 +153,7 @@ def _guarded_pool_classes() -> dict[str, Any]:
 
 def install_botocore_outbound_guard(client: Any) -> Any:
     """Install the native Bedrock connection guard on a newly-created botocore client."""
-    from tools.url_safety import SSRFConnectionBlocked
+    from tools.url_safety import SSRFConnectionBlocked, ssrf_policy_fingerprint
 
     endpoint = getattr(client, "_endpoint", None)
     session = getattr(endpoint, "http_session", None)
@@ -162,8 +174,11 @@ def install_botocore_outbound_guard(client: Any) -> Any:
     session._pool_classes_by_scheme = pool_classes
 
     original_send = session.send
+    installed_policy = ssrf_policy_fingerprint()
 
     def guarded_send(_session, request):
+        if ssrf_policy_fingerprint() != installed_policy:
+            raise SSRFConnectionBlocked("Blocked Bedrock request after outbound network policy changed")
         token = _current_target.set(_target_from_url(request.url))
         try:
             return original_send(request)

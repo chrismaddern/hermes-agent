@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tools.url_safety import SSRFConnectionBlocked
+from tools.url_safety import SSRFConnectionBlocked, _reset_allow_private_cache
 
 
 _PROXY_ENV_VARS = (
@@ -46,6 +46,30 @@ def test_boto3_runtime_client_blocks_private_endpoint_before_socket_dial(monkeyp
             client.invoke_model(modelId="amazon.titan-text-lite-v1", body=b"{}")
 
 
+def test_boto3_runtime_client_rejects_reuse_after_policy_change(monkeypatch):
+    pytest.importorskip("boto3")
+    from agent import bedrock_adapter
+
+    bedrock_adapter.reset_client_cache()
+    for name in _PROXY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://private.test:8765")
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+    _reset_allow_private_cache()
+    client = bedrock_adapter._get_bedrock_runtime_client("us-east-1")
+
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "false")
+    _reset_allow_private_cache()
+    try:
+        with pytest.raises(SSRFConnectionBlocked, match="policy changed"):
+            client.invoke_model(modelId="amazon.titan-text-lite-v1", body=b"{}")
+    finally:
+        _reset_allow_private_cache()
+
+
 def test_boto3_runtime_client_dials_only_the_validated_public_ip(monkeypatch):
     pytest.importorskip("boto3")
     from agent import bedrock_adapter
@@ -79,6 +103,44 @@ def test_boto3_runtime_client_dials_only_the_validated_public_ip(monkeypatch):
             client.invoke_model(modelId="amazon.titan-text-lite-v1", body=b"{}")
 
     assert attempts == [("93.184.216.34", 8765)]
+
+
+def test_boto3_runtime_client_tries_the_next_validated_ip(monkeypatch):
+    pytest.importorskip("boto3")
+    from agent import bedrock_adapter
+
+    class StopAtSecondDial(BaseException):
+        pass
+
+    bedrock_adapter.reset_client_cache()
+    for name in _PROXY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://public.test:8765")
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda _host, port, *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", port)),
+        ],
+    )
+    attempts = []
+
+    def dial(address, *_args, **_kwargs):
+        attempts.append(address)
+        if len(attempts) == 1:
+            raise OSError("first public address is unavailable")
+        raise StopAtSecondDial
+
+    with patch("urllib3.util.connection.create_connection", dial):
+        client = bedrock_adapter._get_bedrock_runtime_client("us-east-1")
+        with pytest.raises(StopAtSecondDial):
+            client.invoke_model(modelId="amazon.titan-text-lite-v1", body=b"{}")
+
+    assert attempts == [("93.184.216.34", 8765), ("1.1.1.1", 8765)]
 
 
 def test_boto3_runtime_client_revalidates_dns_at_socket_connect(monkeypatch):
@@ -125,7 +187,7 @@ def test_anthropic_bedrock_receives_guarded_sdk_http_client(monkeypatch):
     fake_sdk.AnthropicBedrock = MagicMock(return_value=MagicMock())
     monkeypatch.setattr(anthropic_adapter, "_anthropic_sdk", fake_sdk)
     monkeypatch.setattr(
-        "agent.bedrock_adapter.scoped_aws_session_kwargs", lambda: {}
+        "agent.bedrock_adapter.scoped_aws_session_kwargs", dict
     )
 
     anthropic_adapter.build_anthropic_bedrock_client("us-west-2")

@@ -102,13 +102,20 @@ _BLOCKED_HOSTNAMES = frozenset({"metadata.google.internal", "metadata.goog"})
 _METADATA_V4 = (
     "169.254.169.254",  # AWS/GCP/Azure/DO/Oracle metadata
     "169.254.170.2",    # AWS ECS task metadata (task IAM creds)
+    "169.254.170.23",   # AWS EKS Pod Identity credentials
     "169.254.169.253",  # Azure IMDS wire server
+    "168.63.129.16",    # Azure WireServer / host-agent endpoint
     "100.100.100.200",  # Alibaba Cloud metadata
+    "192.0.0.192",      # Oracle Cloud legacy metadata
 )
 _ALWAYS_BLOCKED_IPS = frozenset(
     {ipaddress.ip_address(ip) for ip in _METADATA_V4}
     | {ipaddress.ip_address("::ffff:" + ip) for ip in _METADATA_V4}
-    | {ipaddress.ip_address("fd00:ec2::254")}  # AWS metadata (IPv6)
+    | {
+        ipaddress.ip_address("fd00:ec2::254"),  # AWS metadata (IPv6)
+        ipaddress.ip_address("fd00:ec2::23"),   # AWS EKS Pod Identity (IPv6)
+        ipaddress.ip_address("fd20:ce::254"),   # Google Cloud metadata (IPv6)
+    }
 )
 # Entire link-local range (no legit agent target), plus its IPv4-mapped form.
 _ALWAYS_BLOCKED_NETWORKS = tuple(ipaddress.ip_network(n) for n in ("169.254.0.0/16", "::ffff:169.254.0.0/112"))
@@ -306,10 +313,21 @@ def _is_declared_fake_ip(ip: _IPAddress) -> bool:
     """True when *ip* falls in a block declared in ``security.fake_ip_ranges``. The dial still goes
     to the local proxy, which resolves and connects to the real target, so a declared block grants
     no reach an attacker lacks through the proxy's own DNS; undeclared ranges keep the private verdict."""
-    return any(
-        any(candidate in net for net in _global_fake_ip_ranges())
-        for candidate in (ip, *_embedded_ipv4s(ip))
+    ranges = _global_fake_ip_ranges()
+    candidates = (ip, *_embedded_ipv4s(ip))
+    declared = tuple(
+        any(candidate.version == net.version and candidate in net for net in ranges)
+        for candidate in candidates
     )
+    if not any(declared):
+        return False
+
+    def blocked(candidate: _IPAddress) -> bool:
+        return not candidate.is_global or candidate.is_multicast or candidate in _CGNAT_NETWORK
+
+    # A declaration may name a benchmark-space fake answer (including its translated wrapper),
+    # but it may never use a declared transition range to excuse an undeclared embedded private IP.
+    return all(not blocked(candidate) or is_declared for candidate, is_declared in zip(candidates, declared))
 
 
 def _is_blocked_ip(ip: _IPAddress) -> bool:
@@ -806,15 +824,20 @@ def _guard_request_target(request: Any, *, proxy_configured: bool = False) -> No
 
 
 def ssrf_safe_event_hooks(
-    event_hooks: Any = None, *, is_async: bool = False, proxy_configured: bool = False
+    event_hooks: Any = None, *, is_async: bool = False, proxy_configured: bool = False,
+    policy_fingerprint: Any = None,
 ) -> dict[str, list]:
     """Merge a fail-closed target check ahead of existing httpx/httpx2 request hooks."""
     hooks = {name: list(callbacks) for name, callbacks in dict(event_hooks or {}).items()}
 
     async def async_guard(request: Any) -> None:
+        if policy_fingerprint is not None and ssrf_policy_fingerprint() != policy_fingerprint:
+            raise SSRFConnectionBlocked("Blocked request after outbound network policy changed")
         await asyncio.to_thread(_guard_request_target, request, proxy_configured=proxy_configured)
 
     def sync_guard(request: Any) -> None:
+        if policy_fingerprint is not None and ssrf_policy_fingerprint() != policy_fingerprint:
+            raise SSRFConnectionBlocked("Blocked request after outbound network policy changed")
         _guard_request_target(request, proxy_configured=proxy_configured)
 
     guard = async_guard if is_async else sync_guard
@@ -832,7 +855,8 @@ def create_ssrf_safe_async_client_for(httpx_module: Any, **kwargs: Any) -> Any:
     """Create a guarded async client from ``httpx`` or the MCP SDK's ``httpx2`` module."""
     proxy_configured = _client_proxy_configured(kwargs)
     kwargs["event_hooks"] = ssrf_safe_event_hooks(
-        kwargs.get("event_hooks"), is_async=True, proxy_configured=proxy_configured)
+        kwargs.get("event_hooks"), is_async=True, proxy_configured=proxy_configured,
+        policy_fingerprint=ssrf_policy_fingerprint())
     client = httpx_module.AsyncClient(**kwargs)
     _install_ssrf_guard_on_client(client, is_async=True)
     return client
@@ -842,7 +866,8 @@ def create_ssrf_safe_client_for(httpx_module: Any, **kwargs: Any) -> Any:
     """Create a guarded sync client from an httpx-compatible module."""
     proxy_configured = _client_proxy_configured(kwargs)
     kwargs["event_hooks"] = ssrf_safe_event_hooks(
-        kwargs.get("event_hooks"), proxy_configured=proxy_configured)
+        kwargs.get("event_hooks"), proxy_configured=proxy_configured,
+        policy_fingerprint=ssrf_policy_fingerprint())
     client = httpx_module.Client(**kwargs)
     _install_ssrf_guard_on_client(client)
     return client
