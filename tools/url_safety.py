@@ -519,7 +519,9 @@ def _proxy_origin_pin(schemes_by_origin_var: Any) -> tuple[str, int, str, str]:
 
 
 def _wire_hostname(host: str) -> str:
-    normalized = _normalize_hostname(host)
+    # Keep a DNS root-label suffix: httpx preserves it in CONNECT and absolute-form
+    # proxy requests, and stripping it here would make the pinned-authority rewrite miss.
+    normalized = (host or "").strip().lower()
     try:
         return ipaddress.ip_address(normalized).compressed
     except ValueError:
@@ -547,6 +549,8 @@ def _rewrite_proxy_request(buffer: bytes, host: str, port: int, scheme: str, ip:
             buffer,
             count=1,
         )
+    if buffer.startswith(b"CONNECT "):
+        raise SSRFConnectionBlocked("Blocked proxy CONNECT with an unpinned destination authority")
 
     line_end = buffer.find(b"\r\n")
     if line_end > 0:
@@ -561,16 +565,22 @@ def _rewrite_proxy_request(buffer: bytes, host: str, port: int, scheme: str, ip:
                 if parts[1].startswith(prefix + old + b"/") or parts[1] == prefix + old:
                     parts[1] = prefix + new + parts[1][len(prefix + old):]
                     return b" ".join(parts) + buffer[line_end:]
+            if parts[1].startswith((b"http://", b"https://")):
+                raise SSRFConnectionBlocked(
+                    "Blocked absolute-form proxy request with an unpinned destination authority"
+                )
 
     # SOCKS5 CONNECT with a domain-name target (RFC 1928, ATYP=3).
     if len(buffer) >= 7 and buffer[:4] == b"\x05\x01\x00\x03":
         size = buffer[4]
         end = 5 + size
         if len(buffer) >= end + 2 and _normalize_hostname(
-                buffer[5:end].decode("ascii", "ignore")) == _wire_hostname(host):
+                buffer[5:end].decode("ascii", "ignore")) == _normalize_hostname(_wire_hostname(host)):
             packed = ipaddress.ip_address(ip).packed
             atyp = b"\x01" if len(packed) == 4 else b"\x04"
             return buffer[:3] + atyp + packed + buffer[end:]
+        if len(buffer) >= end + 2:
+            raise SSRFConnectionBlocked("Blocked SOCKS request with an unpinned destination authority")
     return buffer
 
 

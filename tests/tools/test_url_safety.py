@@ -18,6 +18,7 @@ from tools.url_safety import (
     _SSRFGuardedAsyncNetworkBackend,
     _SSRFGuardedProxyNetworkBackend,
     _MAX_SSRF_CONNECT_IPS,
+    _rewrite_proxy_request,
     _resolved_http_connect_ips,
     _is_blocked_ip,
     _global_allow_private_urls,
@@ -223,7 +224,13 @@ class TestSSRFGuardedHttpxClient:
         with pytest.raises(SSRFConnectionBlocked, match="Unix socket"):
             await backend.connect_unix_socket("/tmp/hermes.sock")
 
-    def test_proxy_backend_revalidates_and_pins_http_connect(self, monkeypatch):
+    @pytest.mark.parametrize(("origin_host", "wire_host"), [
+        ("éxample.com", "xn--xample-9ua.com"),
+        ("public.example.", "public.example."),
+    ])
+    def test_proxy_backend_revalidates_and_pins_http_connect(
+        self, monkeypatch, origin_host, wire_host
+    ):
         """The proxy receives a validated IP, never a hostname that it can resolve again."""
         import contextvars
 
@@ -242,7 +249,7 @@ class TestSSRFGuardedHttpxClient:
                 return Stream()
 
         origin_var = contextvars.ContextVar("proxy_origin")
-        token = origin_var.set({("éxample.com", 443): "https"})
+        token = origin_var.set({(origin_host, 443): "https"})
         monkeypatch.setattr(
             socket,
             "getaddrinfo",
@@ -254,8 +261,8 @@ class TestSSRFGuardedHttpxClient:
             stream = _SSRFGuardedProxyNetworkBackend(origin_var, Backend()).connect_tcp(
                 "proxy.example", 3128)
             stream.write(
-                b"CONNECT xn--xample-9ua.com:443 HTTP/1.1\r\n"
-                b"Host: xn--xample-9ua.com:443\r\n\r\n")
+                f"CONNECT {wire_host}:443 HTTP/1.1\r\n"
+                f"Host: {wire_host}:443\r\n\r\n".encode())
         finally:
             origin_var.reset(token)
 
@@ -286,7 +293,21 @@ class TestSSRFGuardedHttpxClient:
         finally:
             origin_var.reset(token)
 
-    def test_http_proxy_receives_pinned_public_ip_and_original_host(self, monkeypatch):
+    @pytest.mark.parametrize("buffer", [
+        b"CONNECT other.example:443 HTTP/1.1\r\nHost: other.example:443\r\n\r\n",
+        b"GET https://other.example/resource HTTP/1.1\r\nHost: other.example\r\n\r\n",
+        b"\x05\x01\x00\x03\x0dother.example\x01\xbb",
+    ])
+    def test_proxy_routing_write_with_unpinned_authority_fails_closed(self, buffer):
+        with pytest.raises(SSRFConnectionBlocked, match="unpinned destination authority"):
+            _rewrite_proxy_request(
+                buffer, "public.example", 443, "https", "93.184.216.34"
+            )
+
+    @pytest.mark.parametrize("target_host", ["public.example", "public.example."])
+    def test_http_proxy_receives_pinned_public_ip_and_original_host(
+        self, monkeypatch, target_host
+    ):
         """The real httpx proxy path routes by IP while preserving the HTTP Host header."""
         observed = {}
 
@@ -314,7 +335,7 @@ class TestSSRFGuardedHttpxClient:
                 httpx, proxy=f"http://127.0.0.1:{proxy.server_address[1]}"
             )
             try:
-                response = client.get("http://public.example/resource")
+                response = client.get(f"http://{target_host}/resource")
             finally:
                 client.close()
                 thread.join(timeout=2)
@@ -323,7 +344,7 @@ class TestSSRFGuardedHttpxClient:
         assert observed["request"].startswith(
             b"GET http://93.184.216.34/resource HTTP/1.1\r\n"
         )
-        assert b"\r\nHost: public.example\r\n" in observed["request"]
+        assert f"\r\nHost: {target_host}\r\n".encode() in observed["request"]
 
     def test_http_proxy_pins_each_request_origin(self, monkeypatch):
         """Each origin routed through a proxy gets its own validated IP pin."""
