@@ -540,8 +540,20 @@ def build_anthropic_bedrock_client(region: str):
     scoped = scoped_aws_session_kwargs()
     aws_kwargs = {"aws_access_key": scoped.get("aws_access_key_id"), "aws_secret_key": scoped.get("aws_secret_access_key"),
                   "aws_session_token": scoped.get("aws_session_token"), "aws_profile": scoped.get("profile_name")}
+    import importlib
+    bedrock_module_name = getattr(sdk.AnthropicBedrock, "__module__", "")
+    bedrock_module = importlib.import_module(bedrock_module_name) if isinstance(bedrock_module_name, str) \
+        and bedrock_module_name else None
+    sdk_httpx = getattr(bedrock_module, "httpx2", None) or getattr(bedrock_module, "httpx", None)
+    if sdk_httpx is None:
+        import httpx as sdk_httpx
+    from tools.url_safety import create_ssrf_safe_client_for
+    http_client = create_ssrf_safe_client_for(
+        sdk_httpx, timeout=sdk_httpx.Timeout(900.0, connect=10.0)
+    )
     return sdk.AnthropicBedrock(
         aws_region=region, timeout=_client_timeout(None), **{k: v for k, v in aws_kwargs.items() if v},
+        http_client=http_client,
         max_retries=0,  # retry belongs to hermes's outer loop (honors Retry-After)
         default_headers={**_beta_header([*_COMMON_BETAS, _CONTEXT_1M_BETA]), **bedrock_guardrail_headers()},
     )

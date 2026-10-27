@@ -127,10 +127,13 @@ def _cached_client(cache: dict[str, Any], service: str, region: str):
     """Get or create a per-region boto3 client. Unscoped: the default credential chain, one client per
     region. Routed profile: one client per (home, service, region), built from that profile's scoped
     ``AWS_*`` (falling back to the default chain only for what the profile does not set)."""
+    from agent.bedrock_http_guard import install_botocore_outbound_guard
     from hermes_constants import get_hermes_home_override, hermes_home_key
     if get_hermes_home_override() is None:
         if region not in cache:
-            cache[region] = _require_boto3().client(service, region_name=region)
+            cache[region] = install_botocore_outbound_guard(
+                _require_boto3().client(service, region_name=region)
+            )
         return cache[region]
     key = (hermes_home_key(), service, region)
     client = _bedrock_clients_by_home.get(key)
@@ -138,7 +141,9 @@ def _cached_client(cache: dict[str, Any], service: str, region: str):
         # Scope check first: a cred-less multiplex profile must hit the ambient-chain
         # refusal, not a boto3 ImportError on hosts that lack the package.
         kwargs = scoped_aws_session_kwargs()
-        client = _require_boto3().Session(**kwargs).client(service, region_name=region)
+        client = install_botocore_outbound_guard(
+            _require_boto3().Session(**kwargs).client(service, region_name=region)
+        )
         _bedrock_clients_by_home[key] = client
     return client
 
