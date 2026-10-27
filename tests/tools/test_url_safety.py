@@ -1,6 +1,8 @@
 """Tests for SSRF protection in url_safety module."""
 
 import socket
+import socketserver
+import threading
 from unittest.mock import patch
 
 import httpx
@@ -14,11 +16,13 @@ from tools.url_safety import (
     create_ssrf_safe_async_client,
     SSRFConnectionBlocked,
     _SSRFGuardedAsyncNetworkBackend,
+    _SSRFGuardedProxyNetworkBackend,
     _MAX_SSRF_CONNECT_IPS,
     _resolved_http_connect_ips,
     _is_blocked_ip,
     _global_allow_private_urls,
     _reset_allow_private_cache,
+    create_ssrf_safe_client_for,
     create_ssrf_safe_async_client_for,
 )
 
@@ -219,6 +223,159 @@ class TestSSRFGuardedHttpxClient:
         with pytest.raises(SSRFConnectionBlocked, match="Unix socket"):
             await backend.connect_unix_socket("/tmp/hermes.sock")
 
+    def test_proxy_backend_revalidates_and_pins_http_connect(self, monkeypatch):
+        """The proxy receives a validated IP, never a hostname that it can resolve again."""
+        import contextvars
+
+        writes = []
+
+        class Stream:
+            def write(self, buffer, timeout=None):
+                writes.append(buffer)
+
+            def close(self):
+                pass
+
+        class Backend:
+            def connect_tcp(self, host, port, **_kwargs):
+                assert (host, port) == ("proxy.example", 3128)
+                return Stream()
+
+        origin_var = contextvars.ContextVar("proxy_origin")
+        token = origin_var.set({("éxample.com", 443): "https"})
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda *_args, **_kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ],
+        )
+        try:
+            stream = _SSRFGuardedProxyNetworkBackend(origin_var, Backend()).connect_tcp(
+                "proxy.example", 3128)
+            stream.write(
+                b"CONNECT xn--xample-9ua.com:443 HTTP/1.1\r\n"
+                b"Host: xn--xample-9ua.com:443\r\n\r\n")
+        finally:
+            origin_var.reset(token)
+
+        assert writes == [
+            b"CONNECT 93.184.216.34:443 HTTP/1.1\r\nHost: 93.184.216.34:443\r\n\r\n"
+        ]
+
+    def test_proxy_backend_rejects_dns_rebinding_before_proxy_connect(self, monkeypatch):
+        import contextvars
+
+        class Backend:
+            def connect_tcp(self, *_args, **_kwargs):
+                pytest.fail("the proxy socket must not open for a rebound private target")
+
+        origin_var = contextvars.ContextVar("proxy_origin")
+        token = origin_var.set({("rebound.example", 443): "https"})
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda *_args, **_kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))
+            ],
+        )
+        try:
+            with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+                _SSRFGuardedProxyNetworkBackend(origin_var, Backend()).connect_tcp(
+                    "proxy.example", 3128)
+        finally:
+            origin_var.reset(token)
+
+    def test_http_proxy_receives_pinned_public_ip_and_original_host(self, monkeypatch):
+        """The real httpx proxy path routes by IP while preserving the HTTP Host header."""
+        observed = {}
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(2)
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    request += self.request.recv(4096)
+                observed["request"] = request
+                self.request.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+
+        real_getaddrinfo = socket.getaddrinfo
+
+        def resolve(host, port, *args, **kwargs):
+            if host == "public.example":
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+            return real_getaddrinfo(host, port, *args, **kwargs)
+
+        monkeypatch.setattr(socket, "getaddrinfo", resolve)
+        with socketserver.TCPServer(("127.0.0.1", 0), Handler) as proxy:
+            thread = threading.Thread(target=proxy.handle_request, daemon=True)
+            thread.start()
+            client = create_ssrf_safe_client_for(
+                httpx, proxy=f"http://127.0.0.1:{proxy.server_address[1]}"
+            )
+            try:
+                response = client.get("http://public.example/resource")
+            finally:
+                client.close()
+                thread.join(timeout=2)
+
+        assert response.text == "ok"
+        assert observed["request"].startswith(
+            b"GET http://93.184.216.34/resource HTTP/1.1\r\n"
+        )
+        assert b"\r\nHost: public.example\r\n" in observed["request"]
+
+    def test_http_proxy_pins_each_request_origin(self, monkeypatch):
+        """Each origin routed through a proxy gets its own validated IP pin."""
+        observed = []
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(2)
+                pending = b""
+                while b"\r\n\r\n" not in pending:
+                    pending += self.request.recv(4096)
+                request, _pending = pending.split(b"\r\n\r\n", 1)
+                observed.append(request + b"\r\n\r\n")
+                self.request.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                    b"Connection: close\r\n\r\nok"
+                )
+
+        public_ips = {
+            "first.public.test": "93.184.216.34",
+            "second.public.test": "1.1.1.1",
+        }
+        real_getaddrinfo = socket.getaddrinfo
+
+        def resolve(host, port, *args, **kwargs):
+            if host in public_ips:
+                return [
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", (public_ips[host], port))
+                ]
+            return real_getaddrinfo(host, port, *args, **kwargs)
+
+        monkeypatch.setattr(socket, "getaddrinfo", resolve)
+        with socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler) as proxy:
+            thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+            thread.start()
+            client = create_ssrf_safe_client_for(
+                httpx, proxy=f"http://127.0.0.1:{proxy.server_address[1]}"
+            )
+            try:
+                assert client.get("http://first.public.test/one").status_code == 200
+                assert client.get("http://second.public.test/two").status_code == 200
+            finally:
+                client.close()
+                proxy.shutdown()
+                thread.join(timeout=2)
+
+        assert len(observed) == 2
+        assert observed[0].startswith(b"GET http://93.184.216.34/one HTTP/1.1\r\n")
+        assert b"\r\nHost: first.public.test\r\n" in observed[0]
+        assert observed[1].startswith(b"GET http://1.1.1.1/two HTTP/1.1\r\n")
+        assert b"\r\nHost: second.public.test\r\n" in observed[1]
+
     def test_async_client_rejects_unpatchable_custom_transport(self):
         class CustomTransport(httpx.AsyncBaseTransport):
             async def handle_async_request(self, request):
@@ -228,8 +385,8 @@ class TestSSRFGuardedHttpxClient:
             create_ssrf_safe_async_client(transport=CustomTransport())
 
     @pytest.mark.asyncio
-    async def test_async_client_preserves_env_proxy_mounts(self, monkeypatch):
-        """Installing the guard must not disable or rewrite httpx env proxy setup."""
+    async def test_async_client_guards_env_proxy_mounts(self, monkeypatch):
+        """Proxy mounts remain configured but may not delegate unvalidated target DNS."""
         for proxy_var in (
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -256,7 +413,7 @@ class TestSSRFGuardedHttpxClient:
             )
             assert all(
                 type(transport._pool._network_backend).__name__
-                != "_SSRFGuardedAsyncNetworkBackend"
+                == "_SSRFGuardedAsyncProxyNetworkBackend"
                 for transport in proxy_transports
             )
             monkeypatch.setattr(
@@ -264,9 +421,10 @@ class TestSSRFGuardedHttpxClient:
                 "getaddrinfo",
                 lambda *_args, **_kwargs: (_ for _ in ()).throw(socket.gaierror("proxy DNS only")),
             )
-            await client.event_hooks["request"][0](
-                httpx.Request("GET", "https://public-via-proxy.example/resource")
-            )
+            with pytest.raises(SSRFConnectionBlocked, match="DNS resolution failed"):
+                await client.event_hooks["request"][0](
+                    httpx.Request("GET", "https://public-via-proxy.example/resource")
+                )
         finally:
             await client.aclose()
 

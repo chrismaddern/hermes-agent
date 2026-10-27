@@ -241,7 +241,8 @@ def _shared_transport_key(base_url: str, verify: Any, proxy: Optional[str]) -> t
         verify_key = ("path", verify)
     else:
         verify_key = ("id", id(verify))  # SSLContext / custom object: share by identity only
-    return (verify_key, proxy, _uses_codex_cloud_transport(base_url))
+    from tools.url_safety import ssrf_policy_fingerprint
+    return (verify_key, proxy, _uses_codex_cloud_transport(base_url), ssrf_policy_fingerprint())
 
 
 def _get_shared_transport(key: tuple, build) -> Any:
@@ -330,7 +331,9 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
             # Default transport = the https view; otherwise httpx builds a third, never-used
             # direct transport (pool + SSL context) per client.
             return client_cls(limits=limits, timeout=timeout, transport=mounts["https://"], mounts=mounts)
-    return client_cls(limits=limits, timeout=timeout, proxy=proxy, mounts=mounts or None, verify=verify)
+    client = client_cls(limits=limits, timeout=timeout, proxy=proxy, mounts=mounts or None, verify=verify)
+    from tools.url_safety import install_ssrf_guard_on_client
+    return install_ssrf_guard_on_client(client, is_async=async_mode)
 
 
 def _install_safe_stdio() -> None:

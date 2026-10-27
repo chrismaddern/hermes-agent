@@ -226,6 +226,15 @@ def _global_fake_ip_ranges() -> tuple:
     return _cached_fake_ip_ranges
 
 
+def ssrf_policy_fingerprint() -> tuple[bool, tuple[str, ...]]:
+    """Hashable identity for connection pools governed by the active outbound policy.
+
+    A pool opened while private destinations are allowed must never be reused after the active
+    profile/policy becomes guarded: an already-open socket does not cross the connect boundary again.
+    """
+    return _global_allow_private_urls(), tuple(str(net) for net in _global_fake_ip_ranges())
+
+
 def _normalize_hostname(host: Optional[str]) -> str:
     return (host or "").strip().lower().rstrip(".")
 
@@ -501,6 +510,150 @@ class _SSRFGuardedBackendBase:
         raise SSRFConnectionBlocked("Blocked Unix socket connection in SSRF-safe transport")
 
 
+def _proxy_origin_pin(schemes_by_origin_var: Any) -> tuple[str, int, str, str]:
+    origins = schemes_by_origin_var.get({})
+    if len(origins) != 1:
+        raise SSRFConnectionBlocked("Blocked proxy connection without one validated target origin")
+    ((host, port), scheme), = origins.items()
+    return host, port, scheme, _resolved_http_connect_ips(host, port, scheme)[0]
+
+
+def _wire_hostname(host: str) -> str:
+    normalized = _normalize_hostname(host)
+    try:
+        return ipaddress.ip_address(normalized).compressed
+    except ValueError:
+        return normalized.encode("idna").decode("ascii")
+
+
+def _authority(host: str, port: int) -> bytes:
+    host = _wire_hostname(host)
+    rendered = f"[{host}]" if ":" in host else host
+    return f"{rendered}:{port}".encode("ascii")
+
+
+def _rewrite_proxy_request(buffer: bytes, host: str, port: int, scheme: str, ip: str) -> bytes:
+    """Pin an HTTP CONNECT/absolute-form or SOCKS5 destination to a validated IP.
+
+    HTTP Host and TLS SNI remain the original hostname; only the proxy routing authority changes,
+    so the proxy never performs a second, attacker-controlled DNS lookup.
+    """
+    old_authority, new_authority = _authority(host, port), _authority(ip, port)
+    if buffer.startswith(b"CONNECT " + old_authority + b" "):
+        buffer = buffer.replace(b"CONNECT " + old_authority + b" ", b"CONNECT " + new_authority + b" ", 1)
+        return re.sub(
+            rb"(?im)^(Host:[ \t]*)" + re.escape(old_authority) + rb"([ \t]*)(\r?)$",
+            lambda match: match.group(1) + new_authority + match.group(2) + match.group(3),
+            buffer,
+            count=1,
+        )
+
+    line_end = buffer.find(b"\r\n")
+    if line_end > 0:
+        first_line = buffer[:line_end]
+        parts = first_line.split(b" ", 2)
+        if len(parts) == 3:
+            prefix = scheme.encode("ascii") + b"://"
+            wire_host = _wire_hostname(host)
+            host_only = (f"[{wire_host}]" if ":" in wire_host else wire_host).encode("ascii")
+            ip_only = (f"[{ip}]" if ":" in ip else ip).encode("ascii")
+            for old, new in ((old_authority, new_authority), (host_only, ip_only)):
+                if parts[1].startswith(prefix + old + b"/") or parts[1] == prefix + old:
+                    parts[1] = prefix + new + parts[1][len(prefix + old):]
+                    return b" ".join(parts) + buffer[line_end:]
+
+    # SOCKS5 CONNECT with a domain-name target (RFC 1928, ATYP=3).
+    if len(buffer) >= 7 and buffer[:4] == b"\x05\x01\x00\x03":
+        size = buffer[4]
+        end = 5 + size
+        if len(buffer) >= end + 2 and _normalize_hostname(
+                buffer[5:end].decode("ascii", "ignore")) == _wire_hostname(host):
+            packed = ipaddress.ip_address(ip).packed
+            atyp = b"\x01" if len(packed) == 4 else b"\x04"
+            return buffer[:3] + atyp + packed + buffer[end:]
+    return buffer
+
+
+class _PinnedProxyStream:
+    def __init__(self, stream: Any, host: str, port: int, scheme: str, ip: str):
+        self._stream, self._pin = stream, (host, port, scheme, ip)
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return self._stream.read(max_bytes, timeout=timeout)
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        self._stream.write(_rewrite_proxy_request(buffer, *self._pin), timeout=timeout)
+
+    def close(self) -> None:
+        self._stream.close()
+
+    def start_tls(self, ssl_context: Any, server_hostname: str | None = None,
+                  timeout: float | None = None) -> Any:
+        stream = self._stream.start_tls(
+            ssl_context=ssl_context, server_hostname=server_hostname, timeout=timeout)
+        return type(self)(stream, *self._pin)
+
+    def get_extra_info(self, info: str) -> Any:
+        return self._stream.get_extra_info(info)
+
+
+class _PinnedAsyncProxyStream:
+    def __init__(self, stream: Any, host: str, port: int, scheme: str, ip: str):
+        self._stream, self._pin = stream, (host, port, scheme, ip)
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return await self._stream.read(max_bytes, timeout=timeout)
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        await self._stream.write(_rewrite_proxy_request(buffer, *self._pin), timeout=timeout)
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+    async def start_tls(self, ssl_context: Any, server_hostname: str | None = None,
+                        timeout: float | None = None) -> Any:
+        stream = await self._stream.start_tls(
+            ssl_context=ssl_context, server_hostname=server_hostname, timeout=timeout)
+        return type(self)(stream, *self._pin)
+
+    def get_extra_info(self, info: str) -> Any:
+        return self._stream.get_extra_info(info)
+
+
+class _SSRFGuardedProxyNetworkBackend(_SSRFGuardedBackendBase):
+    def __init__(self, schemes_by_origin_var: Any, backend: Any):
+        super().__init__(backend, schemes_by_origin_var)
+
+    def connect_tcp(self, host: str, port: int, timeout: float | None = None,
+                    local_address: str | None = None, socket_options: Any = None) -> Any:
+        pin = _proxy_origin_pin(self._schemes_by_origin_var)
+        stream = self._backend.connect_tcp(
+            host, port, timeout=timeout, local_address=local_address, socket_options=socket_options)
+        return _PinnedProxyStream(stream, *pin)
+
+    def sleep(self, seconds: float) -> None:
+        self._backend.sleep(seconds)
+
+
+class _SSRFGuardedAsyncProxyNetworkBackend(_SSRFGuardedBackendBase):
+    def __init__(self, schemes_by_origin_var: Any, backend: Any):
+        super().__init__(backend, schemes_by_origin_var)
+
+    async def connect_tcp(self, host: str, port: int, timeout: float | None = None,
+                          local_address: str | None = None, socket_options: Any = None) -> Any:
+        pin = await asyncio.to_thread(_proxy_origin_pin, self._schemes_by_origin_var)
+        stream = await self._backend.connect_tcp(
+            host, port, timeout=timeout, local_address=local_address, socket_options=socket_options)
+        return _PinnedAsyncProxyStream(stream, *pin)
+
+    async def connect_unix_socket(self, path: str, timeout: float | None = None,
+                                  socket_options: Any = None) -> Any:
+        raise SSRFConnectionBlocked("Blocked Unix socket proxy connection in SSRF-safe transport")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
+
+
 class _SSRFGuardedAsyncNetworkBackend(_SSRFGuardedBackendBase):
     def __init__(self, schemes_by_origin_var: Any, backend: Any = None):
         if backend is None:
@@ -550,6 +703,8 @@ class _SSRFGuardedNetworkBackend(_SSRFGuardedBackendBase):
 
 def _origin_scheme_context(request: Any) -> dict[tuple[str, int], str]:
     host, port, scheme = request.url.host, request.url.port, request.url.scheme
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
     return {(host, port): scheme} if host and port is not None and scheme in _HTTP_SCHEMES else {}
 
 
@@ -564,8 +719,7 @@ def _origin_scope(schemes_by_origin_var: Any, request: Any):
 
 
 def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any, *, is_async: bool = False) -> None:
-    """Swap the transport's pool network backend for the SSRF-guarded one (idempotent). Only the
-    direct transport is guarded; proxy mounts delegate final-target resolution to the trusted proxy."""
+    """Swap a direct or proxy transport's network backend for the guarded one (idempotent)."""
     state = getattr(transport, "__dict__", {}) if transport is not None else {}
     if transport is None or state.get("_hermes_ssrf_guarded", False):
         return
@@ -578,7 +732,11 @@ def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any,
             state["_hermes_ssrf_guarded"] = True
             return
         raise SSRFConnectionBlocked(f"Unsupported {label} cannot be made SSRF-safe")
-    backend_cls = _SSRFGuardedAsyncNetworkBackend if is_async else _SSRFGuardedNetworkBackend
+    is_proxy = type(pool).__name__ in {"HTTPProxy", "AsyncHTTPProxy", "SOCKSProxy", "AsyncSOCKSProxy"}
+    if is_proxy:
+        backend_cls = _SSRFGuardedAsyncProxyNetworkBackend if is_async else _SSRFGuardedProxyNetworkBackend
+    else:
+        backend_cls = _SSRFGuardedAsyncNetworkBackend if is_async else _SSRFGuardedNetworkBackend
     pool._network_backend = backend_cls(schemes_by_origin_var, backend=pool._network_backend)
     method_name = "handle_async_request" if is_async else "handle_request"
     handle = getattr(transport, method_name, None)
@@ -597,11 +755,21 @@ def _install_ssrf_guard_on_transport(transport: Any, schemes_by_origin_var: Any,
 
 
 def _install_ssrf_guard_on_client(client: Any, *, is_async: bool = False) -> None:
-    """Guard ``client._transport`` only; ``_mounts`` (env/explicit proxies) stay untouched."""
+    """Guard every direct and proxy transport owned by an httpx-compatible client."""
     import contextvars
     var_name = "hermes_ssrf_async_origin_schemes" if is_async else "hermes_ssrf_origin_schemes"
-    _install_ssrf_guard_on_transport(
-        getattr(client, "__dict__", {}).get("_transport"), contextvars.ContextVar(var_name), is_async=is_async)
+    origin_var = contextvars.ContextVar(var_name)
+    transports = [getattr(client, "__dict__", {}).get("_transport")]
+    transports.extend((getattr(client, "__dict__", {}).get("_mounts") or {}).values())
+    for transport in transports:
+        if transport is not None:
+            _install_ssrf_guard_on_transport(transport, origin_var, is_async=is_async)
+
+
+def install_ssrf_guard_on_client(client: Any, *, is_async: bool = False) -> Any:
+    """Install the outbound guard on every transport and return *client*."""
+    _install_ssrf_guard_on_client(client, is_async=is_async)
+    return client
 
 
 def install_ssrf_guard_on_transport(transport: Any, *, is_async: bool = False) -> Any:
@@ -620,10 +788,6 @@ def install_ssrf_guard_on_transport(transport: Any, *, is_async: bool = False) -
 def _guard_request_target(request: Any, *, proxy_configured: bool = False) -> None:
     """Validate every request target, including redirects and proxied requests."""
     url = request.url
-    if proxy_configured:
-        if not is_safe_url(str(url), proxy_configured=True):
-            raise SSRFConnectionBlocked("Blocked private/internal or otherwise unsafe proxied destination")
-        return
     host, scheme = url.host, url.scheme
     port = url.port if url.port is not None else {"http": 80, "https": 443}.get(scheme)
     if not host or port is None:

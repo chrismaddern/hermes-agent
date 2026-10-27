@@ -164,16 +164,32 @@ def test_model_client_proxy_path_still_rejects_private_target(no_proxy_env, monk
         client.close()
 
 
-def test_model_client_proxy_allows_proxy_side_dns(no_proxy_env, monkeypatch):
+def test_model_client_proxy_dns_failure_fails_closed(no_proxy_env, monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
     monkeypatch.setattr("socket.getaddrinfo", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         socket.gaierror("direct DNS unavailable")))
     client = build_keepalive_http_client("https://model.example/v1")
     try:
-        for hook in client._event_hooks["request"]:
-            hook(httpx.Request("GET", "https://model.example/v1/models"))
+        with pytest.raises(SSRFConnectionBlocked, match="DNS resolution failed"):
+            for hook in client._event_hooks["request"]:
+                hook(httpx.Request("GET", "https://model.example/v1/models"))
     finally:
         client.close()
+
+
+def test_private_url_opt_out_does_not_share_a_guarded_pool(no_proxy_env, monkeypatch):
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+    _reset_allow_private_cache()
+    permissive = build_keepalive_http_client("https://model.example/v1")
+
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "false")
+    _reset_allow_private_cache()
+    guarded = build_keepalive_http_client("https://model.example/v1")
+    try:
+        assert _inner(permissive) is not _inner(guarded)
+    finally:
+        permissive.close()
+        guarded.close()
 
 
 def test_closing_one_client_leaves_sibling_functional(no_proxy_env, local_server):
