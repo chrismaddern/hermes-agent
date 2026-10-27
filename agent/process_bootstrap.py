@@ -300,7 +300,6 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
     hooks = ssrf_safe_event_hooks(
         codex_request_compression_hooks(base_url, async_mode=async_mode),
         is_async=async_mode,
-        proxy_configured=proxy is not None,
     )
     client_cls = functools.partial(client_cls, event_hooks=hooks)
     if proxy is None:

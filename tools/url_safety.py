@@ -120,9 +120,12 @@ _ALWAYS_BLOCKED_IPS = frozenset(
 # Entire link-local range (no legit agent target), plus its IPv4-mapped form.
 _ALWAYS_BLOCKED_NETWORKS = tuple(ipaddress.ip_network(n) for n in ("169.254.0.0/16", "::ffff:169.254.0.0/112"))
 
-# Exact HTTPS hostnames allowed to resolve to private/benchmark-space IPs
-# (QQ media legitimately resolves to 198.18.0.0/15 behind local proxy infra).
-_TRUSTED_PRIVATE_IP_HOSTS = frozenset({"multimedia.nt.qq.com.cn"})
+# Narrow compatibility exceptions for exact HTTPS host + address-range pairs.
+# QQ media legitimately resolves to benchmark-space addresses behind local proxy infra; the
+# hostname alone is not trusted, so poisoned loopback/RFC1918 answers remain blocked.
+_TRUSTED_PRIVATE_IP_NETWORKS = {
+    "multimedia.nt.qq.com.cn": (ipaddress.ip_network("198.18.0.0/15"),),
+}
 _MAX_SSRF_CONNECT_IPS = 8
 
 # 100.64.0.0/10 (CGNAT, RFC 6598) is neither is_private nor is_global in
@@ -377,9 +380,16 @@ def is_always_blocked_url(url: str) -> bool:
         return False
 
 
-def _allows_private_ip_resolution(hostname: str, scheme: str) -> bool:
-    """Return True when a trusted HTTPS hostname may bypass IP-class blocking."""
-    return scheme == "https" and hostname in _TRUSTED_PRIVATE_IP_HOSTS
+def _allows_private_ip_resolution(hostname: str, scheme: str, ip: _IPAddress) -> bool:
+    """Return True only for a trusted HTTPS hostname's documented private address range."""
+    if scheme != "https":
+        return False
+    networks = _TRUSTED_PRIVATE_IP_NETWORKS.get(hostname, ())
+    return any(
+        candidate.version == network.version and candidate in network
+        for candidate in (ip, *_embedded_ipv4s(ip))
+        for network in networks
+    )
 
 
 def _resolved_ip_block_reason(ip: _IPAddress, allow_private: bool) -> Optional[str]:
@@ -415,8 +425,7 @@ def is_safe_url(url: str, *, proxy_configured: Optional[bool] = None) -> bool:
             logger.warning("Blocked request to internal hostname: %s", hostname)
             return False
         allow_all_private = _global_allow_private_urls()
-        allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
-        allow_private = allow_all_private or allow_private_ip
+        allowed_trusted_private = False
         try:
             addr_info = _getaddrinfo(hostname)
         except socket.gaierror:
@@ -436,13 +445,15 @@ def is_safe_url(url: str, *, proxy_configured: Optional[bool] = None) -> bool:
             if ip is None:
                 logger.warning("Blocked request — unparseable IP address %r for hostname %s", raw, hostname)
                 return False
-            reason = _resolved_ip_block_reason(ip, allow_private)
+            allow_trusted_private = _allows_private_ip_resolution(hostname, scheme, ip)
+            reason = _resolved_ip_block_reason(ip, allow_all_private or allow_trusted_private)
             if reason is not None:
                 logger.warning("Blocked request to %s: %s -> %s", reason, hostname, ip_str)
                 return False
+            allowed_trusted_private = allowed_trusted_private or allow_trusted_private
         if allow_all_private:
             logger.debug("Allowing private/internal resolution (security.allow_private_urls=true): %s", hostname)
-        elif allow_private_ip:
+        elif allowed_trusted_private:
             logger.debug("Allowing trusted hostname despite private/internal resolution: %s", hostname)
         return True
     except Exception as exc:
@@ -473,7 +484,7 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
         raise SSRFConnectionBlocked("Blocked request with empty hostname")
     if hostname in _BLOCKED_HOSTNAMES:
         raise SSRFConnectionBlocked(f"Blocked request to internal hostname: {hostname}")
-    allow_private = _global_allow_private_urls() or _allows_private_ip_resolution(hostname, scheme)
+    allow_all_private = _global_allow_private_urls()
     try:
         addr_info = _getaddrinfo(hostname, port)
     except socket.gaierror as exc:
@@ -484,7 +495,9 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
             raise SSRFConnectionBlocked(
                 f"Blocked request - unparseable IP address {raw!r} for hostname {hostname}"
             ) from ValueError(f"{ip_str!r} does not appear to be an IPv4 or IPv6 address")
-        reason = _resolved_ip_block_reason(ip, allow_private)
+        reason = _resolved_ip_block_reason(
+            ip, allow_all_private or _allows_private_ip_resolution(hostname, scheme, ip)
+        )
         if reason is not None:
             raise SSRFConnectionBlocked(f"Blocked request to {reason} during connect: {hostname} -> {ip_str}")
         if ip_str not in safe_ips and len(safe_ips) < _MAX_SSRF_CONNECT_IPS:
@@ -813,8 +826,12 @@ def install_ssrf_guard_on_transport(transport: Any, *, is_async: bool = False) -
     return transport
 
 
-def _guard_request_target(request: Any, *, proxy_configured: bool = False) -> None:
-    """Validate every request target, including redirects and proxied requests."""
+def _guard_request_target(request: Any) -> None:
+    """Validate every request target, including redirects and proxied requests.
+
+    Proxied targets deliberately use local DNS too: the validated IP is written into CONNECT,
+    absolute-form HTTP, or SOCKS routing so an upstream proxy cannot resolve the hostname again.
+    """
     url = request.url
     host, scheme = url.host, url.scheme
     port = url.port if url.port is not None else {"http": 80, "https": 443}.get(scheme)
@@ -824,8 +841,7 @@ def _guard_request_target(request: Any, *, proxy_configured: bool = False) -> No
 
 
 def ssrf_safe_event_hooks(
-    event_hooks: Any = None, *, is_async: bool = False, proxy_configured: bool = False,
-    policy_fingerprint: Any = None,
+    event_hooks: Any = None, *, is_async: bool = False, policy_fingerprint: Any = None,
 ) -> dict[str, list]:
     """Merge a fail-closed target check ahead of existing httpx/httpx2 request hooks."""
     hooks = {name: list(callbacks) for name, callbacks in dict(event_hooks or {}).items()}
@@ -833,30 +849,22 @@ def ssrf_safe_event_hooks(
     async def async_guard(request: Any) -> None:
         if policy_fingerprint is not None and ssrf_policy_fingerprint() != policy_fingerprint:
             raise SSRFConnectionBlocked("Blocked request after outbound network policy changed")
-        await asyncio.to_thread(_guard_request_target, request, proxy_configured=proxy_configured)
+        await asyncio.to_thread(_guard_request_target, request)
 
     def sync_guard(request: Any) -> None:
         if policy_fingerprint is not None and ssrf_policy_fingerprint() != policy_fingerprint:
             raise SSRFConnectionBlocked("Blocked request after outbound network policy changed")
-        _guard_request_target(request, proxy_configured=proxy_configured)
+        _guard_request_target(request)
 
     guard = async_guard if is_async else sync_guard
     hooks["request"] = [guard, *hooks.get("request", [])]
     return hooks
 
 
-def _client_proxy_configured(kwargs: dict[str, Any]) -> bool:
-    if kwargs.get("proxy") is not None or bool(kwargs.get("mounts")):
-        return True
-    return kwargs.get("trust_env", True) is not False and _proxy_is_configured()
-
-
 def create_ssrf_safe_async_client_for(httpx_module: Any, **kwargs: Any) -> Any:
     """Create a guarded async client from ``httpx`` or the MCP SDK's ``httpx2`` module."""
-    proxy_configured = _client_proxy_configured(kwargs)
     kwargs["event_hooks"] = ssrf_safe_event_hooks(
-        kwargs.get("event_hooks"), is_async=True, proxy_configured=proxy_configured,
-        policy_fingerprint=ssrf_policy_fingerprint())
+        kwargs.get("event_hooks"), is_async=True, policy_fingerprint=ssrf_policy_fingerprint())
     client = httpx_module.AsyncClient(**kwargs)
     _install_ssrf_guard_on_client(client, is_async=True)
     return client
@@ -864,10 +872,8 @@ def create_ssrf_safe_async_client_for(httpx_module: Any, **kwargs: Any) -> Any:
 
 def create_ssrf_safe_client_for(httpx_module: Any, **kwargs: Any) -> Any:
     """Create a guarded sync client from an httpx-compatible module."""
-    proxy_configured = _client_proxy_configured(kwargs)
     kwargs["event_hooks"] = ssrf_safe_event_hooks(
-        kwargs.get("event_hooks"), proxy_configured=proxy_configured,
-        policy_fingerprint=ssrf_policy_fingerprint())
+        kwargs.get("event_hooks"), policy_fingerprint=ssrf_policy_fingerprint())
     client = httpx_module.Client(**kwargs)
     _install_ssrf_guard_on_client(client)
     return client
