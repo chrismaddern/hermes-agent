@@ -273,6 +273,26 @@ def test_translate_native_response_surfaces_reasoning_and_tool_calls():
     assert json.loads(choice.message.tool_calls[0].function.arguments) == {"q": "hermes"}
 
 
+def test_default_http_client_blocks_private_destinations(monkeypatch):
+    from agent.gemini_native_adapter import GeminiNativeClient
+    from tools.url_safety import SSRFConnectionBlocked
+
+    monkeypatch.setattr(
+        "socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("127.0.0.1", 443))],
+    )
+
+    client = GeminiNativeClient(api_key="test-key")
+    try:
+        assert client._http is not None
+        with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+            client._http.event_hooks["request"][0](
+                client._http.build_request("POST", f"{client.base_url}/models/gemini:test")
+            )
+    finally:
+        client.close()
+
+
 def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatch):
     from agent.gemini_native_adapter import GeminiNativeClient
 

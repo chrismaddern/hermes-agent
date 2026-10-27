@@ -571,15 +571,16 @@ class MCPServerTransportMixin:
     def _streamable_http_transport(self, url: str, headers: dict, connect_timeout: float,
                                    ssl_verify, client_cert, oauth_auth,
                                    strict_cfg_headers: bool, configured_header_names: set):
-        """Streamable HTTP context manager: mcp >= 1.24.0 gets a caller-owned httpx client; on the
-        deprecated API (mcp < 1.24.0) the SDK owns the client."""
+        """Streamable HTTP context manager with a caller-owned, guarded httpx client.
+
+        Deprecated SDKs own their transport and cannot enforce the connection boundary, so they
+        fail closed instead of silently restoring unguarded remote HTTP.
+        """
         if not _core._MCP_NEW_HTTP:
-            if strict_cfg_headers:  # fail closed: without an owned client redirects can't be hooked
-                raise ImportError(f"MCP server '{self.name}' requires mcp >= 1.24.0 to "
-                                  "enforce the portable redirect-header boundary "
-                                  "(strict_redirect_headers). Upgrade the mcp package.")
-            return _core.streamablehttp_client(url, headers=headers, timeout=float(connect_timeout), verify=ssl_verify,
-                                               **_present(auth=oauth_auth))
+            raise ImportError(
+                f"MCP server '{self.name}' requires mcp >= 1.24.0 to enforce the outbound "
+                "connection guard. Upgrade the mcp package."
+            )
         # Explicit AsyncClient matching the SDK's create_mcp_http_client defaults; MUST come from the
         # SDK's httpx (httpx2 on mcp >= 2.0) since the SDK sends its own Requests through it.
         httpx = _core.sdk_httpx()

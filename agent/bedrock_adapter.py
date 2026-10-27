@@ -273,7 +273,8 @@ def build_bedrock_openai_http_client(region: str, *, timeout: Optional[float] = 
     kwargs: dict[str, Any] = {"auth": BedrockOpenAISigV4Auth(region)}
     if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
         kwargs["timeout"] = timeout
-    return httpx.Client(**kwargs)
+    from tools.url_safety import create_ssrf_safe_client_for
+    return create_ssrf_safe_client_for(httpx, **kwargs)
 
 
 def configure_bedrock_openai_client_kwargs(client_kwargs: dict[str, Any], *, timeout: Optional[float] = None) -> dict[str, Any]:

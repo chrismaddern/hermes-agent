@@ -159,28 +159,16 @@ def _resolve_aux_verify(base_url: Optional[str]) -> Any:
         return True
 
 
-_WARNED_KEEPALIVE_IMPORT_SKEW = False
-
-
 def _openai_http_client_kwargs(base_url: Optional[str], *, async_mode: bool = False) -> dict[str, Any]:
-    """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
-    try:
-        from agent.process_bootstrap import build_keepalive_http_client
-        client = build_keepalive_http_client(
-            str(base_url or ""), async_mode=async_mode, verify=_resolve_aux_verify(base_url))
-    except (ImportError, AttributeError):
-        # Version-skewed install (Desktop runtime lagging a git tree) lacks this helper:
-        # degrade to the SDK default httpx client rather than kill the job; warn once.
-        global _WARNED_KEEPALIVE_IMPORT_SKEW
-        if not _WARNED_KEEPALIVE_IMPORT_SKEW:
-            _WARNED_KEEPALIVE_IMPORT_SKEW = True
-            logger.warning(
-                "agent.process_bootstrap.build_keepalive_http_client is "
-                "unavailable — mixed/stale install detected (#64333). Falling "
-                "back to the SDK default HTTP client. Run `hermes update` (or "
-                "reinstall the Desktop app) to resync the runtime.")
-        client = None
-    return {"http_client": client} if client is not None else {}
+    """Inject the guarded keepalive client used by auxiliary model traffic.
+
+    A mixed/stale install must fail closed rather than silently restoring the
+    SDK's unguarded default transport.
+    """
+    from agent.process_bootstrap import build_keepalive_http_client
+    client = build_keepalive_http_client(
+        str(base_url or ""), async_mode=async_mode, verify=_resolve_aux_verify(base_url))
+    return {"http_client": client}
 
 
 def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
@@ -4850,7 +4838,11 @@ def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[
     try:
         # Aliased import: a bare `from openai import OpenAI` would shadow the module-level lazy proxy.
         from openai import OpenAI as _VertexOpenAI
-        client = _VertexOpenAI(api_key=token, base_url=base_url)
+        client = _VertexOpenAI(
+            api_key=token,
+            base_url=base_url,
+            **_openai_http_client_kwargs(base_url),
+        )
     except Exception as exc:
         logger.warning("resolve_provider_client: cannot create Vertex client: %s", exc)
         return None, None

@@ -79,6 +79,25 @@ def _mock_botocore_session(*, return_value=None, side_effect=None):
         yield session_mod.get_session
 
 
+def test_bedrock_openai_http_client_blocks_private_destinations(monkeypatch):
+    from agent.bedrock_adapter import build_bedrock_openai_http_client
+    from tools.url_safety import SSRFConnectionBlocked
+
+    monkeypatch.setattr(
+        "socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("127.0.0.1", 443))],
+    )
+
+    client = build_bedrock_openai_http_client("us-east-1")
+    try:
+        with pytest.raises(SSRFConnectionBlocked, match="private/internal"):
+            client.event_hooks["request"][0](
+                client.build_request("GET", "https://bedrock-runtime.us-east-1.amazonaws.com/models")
+            )
+    finally:
+        client.close()
+
+
 # ---------------------------------------------------------------------------
 # AWS credential detection
 # ---------------------------------------------------------------------------

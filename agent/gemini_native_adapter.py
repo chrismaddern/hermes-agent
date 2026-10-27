@@ -206,7 +206,8 @@ def probe_gemini_tier(
     payload = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"maxOutputTokens": 1}}
     headers = {"Content-Type": "application/json", "X-Goog-Api-Client": _api_client()}
     try:
-        with httpx.Client(timeout=timeout) as client:
+        from tools.url_safety import create_ssrf_safe_client_for
+        with create_ssrf_safe_client_for(httpx, timeout=timeout) as client:
             resp = client.post(f"{base}/models/{model}:generateContent", params={"key": key}, json=payload, headers=headers)
     except Exception as exc:
         logger.debug("probe_gemini_tier: network error: %s", exc)
@@ -886,7 +887,13 @@ class GeminiNativeClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat_completion))
         # read=1200: Gemini 4 hops can think for minutes; Google asks for a >=20 min read timeout (its
         # stream limit), and a shorter one cuts long-decode hops off mid-think.
-        self._http = http_client or httpx.Client(timeout=timeout or httpx.Timeout(connect=15.0, read=1200.0, write=30.0, pool=30.0))
+        if http_client is None:
+            from tools.url_safety import create_ssrf_safe_client_for
+            http_client = create_ssrf_safe_client_for(
+                httpx,
+                timeout=timeout or httpx.Timeout(connect=15.0, read=1200.0, write=30.0, pool=30.0),
+            )
+        self._http = http_client
 
     def close(self) -> None:
         self.is_closed = True

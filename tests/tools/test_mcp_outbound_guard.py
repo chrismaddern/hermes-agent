@@ -6,6 +6,7 @@ import httpx2
 import pytest
 
 from tools.mcp_tool_errors import _make_redirect_header_stripper
+from tools.mcp_tool import MCPServerTask
 from tools.url_safety import SSRFConnectionBlocked
 
 
@@ -83,3 +84,20 @@ async def test_mcp_dns_rebinding_is_blocked_at_connect(monkeypatch):
     async with build_client(trust_env=False) as client:
         with pytest.raises(SSRFConnectionBlocked, match="during connect"):
             await client.get("https://mcp.public.test/mcp")
+
+
+def test_legacy_sdk_without_owned_transport_fails_closed(monkeypatch):
+    monkeypatch.setattr("tools.mcp_tool._MCP_NEW_HTTP", False)
+    task = MCPServerTask("public-server")
+
+    with pytest.raises(ImportError, match="outbound connection guard"):
+        task._streamable_http_transport(
+            "https://mcp.public.test/mcp",
+            {},
+            10.0,
+            True,
+            None,
+            None,
+            False,
+            set(),
+        )
