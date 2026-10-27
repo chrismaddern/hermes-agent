@@ -233,7 +233,9 @@ def _shared_transport_cls():
 _SharedTransport: Any = None
 
 
-def _shared_transport_key(base_url: str, verify: Any, proxy: Optional[str]) -> tuple:
+def _shared_transport_key(
+    base_url: str, verify: Any, proxy: Optional[str], policy_fingerprint: tuple
+) -> tuple:
     """Identity under which sync direct transports are pooled process-wide."""
     if verify is True or verify is False:
         verify_key: Any = verify
@@ -241,8 +243,7 @@ def _shared_transport_key(base_url: str, verify: Any, proxy: Optional[str]) -> t
         verify_key = ("path", verify)
     else:
         verify_key = ("id", id(verify))  # SSLContext / custom object: share by identity only
-    from tools.url_safety import ssrf_policy_fingerprint
-    return (verify_key, proxy, _uses_codex_cloud_transport(base_url), ssrf_policy_fingerprint())
+    return (verify_key, proxy, _uses_codex_cloud_transport(base_url), policy_fingerprint)
 
 
 def _get_shared_transport(key: tuple, build) -> Any:
@@ -296,10 +297,16 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
     mounts = None
     # Official Codex backend only: zstd request bodies when the stdlib codec exists (None otherwise).
     from agent.codex_headers import codex_request_compression_hooks
-    from tools.url_safety import install_ssrf_guard_on_transport, ssrf_safe_event_hooks
+    from tools.url_safety import (
+        install_ssrf_guard_on_transport,
+        ssrf_policy_fingerprint,
+        ssrf_safe_event_hooks,
+    )
+    policy_fingerprint = ssrf_policy_fingerprint()
     hooks = ssrf_safe_event_hooks(
         codex_request_compression_hooks(base_url, async_mode=async_mode),
         is_async=async_mode,
+        policy_fingerprint=policy_fingerprint,
     )
     client_cls = functools.partial(client_cls, event_hooks=hooks)
     if proxy is None:
@@ -321,7 +328,7 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
         if async_mode:
             mounts = {"http://": _build_direct(), "https://": _build_direct()}
         else:
-            key = _shared_transport_key(base_url, verify, proxy)
+            key = _shared_transport_key(base_url, verify, proxy, policy_fingerprint)
             view_cls = _shared_transport_cls()
             mounts = {
                 f"{scheme}://": view_cls(_get_shared_transport((scheme, *key), _build_direct))

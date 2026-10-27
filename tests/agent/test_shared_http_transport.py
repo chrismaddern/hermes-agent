@@ -192,6 +192,25 @@ def test_private_url_opt_out_does_not_share_a_guarded_pool(no_proxy_env, monkeyp
         guarded.close()
 
 
+def test_existing_model_client_rejects_requests_after_policy_changes(no_proxy_env, monkeypatch):
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "true")
+    _reset_allow_private_cache()
+    client = build_keepalive_http_client("https://model.example/v1")
+
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "false")
+    _reset_allow_private_cache()
+    monkeypatch.setattr(
+        "socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+    try:
+        with pytest.raises(SSRFConnectionBlocked, match="policy changed"):
+            for hook in client._event_hooks["request"]:
+                hook(httpx.Request("GET", "https://model.example/v1/models"))
+    finally:
+        client.close()
+
+
 def test_closing_one_client_leaves_sibling_functional(no_proxy_env, local_server):
     a = build_keepalive_http_client(local_server)
     b = build_keepalive_http_client(local_server)

@@ -385,9 +385,23 @@ def _allows_private_ip_resolution(hostname: str, scheme: str, ip: _IPAddress) ->
     if scheme != "https":
         return False
     networks = _TRUSTED_PRIVATE_IP_NETWORKS.get(hostname, ())
+    if isinstance(ip, ipaddress.IPv4Address):
+        candidates = (ip,)
+    elif ip.ipv4_mapped is not None:
+        candidates = (ip.ipv4_mapped,)
+    elif any(ip in network for network in (
+        _IPV4_TRANSLATED_NETWORK,
+        _NAT64_WELL_KNOWN_NETWORK,
+        _NAT64_LOCAL_USE_NETWORK,
+    )) or (ip in _IPV4_COMPATIBLE_NETWORK and int(ip) > 0xFFFF):
+        candidates = (ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF),)
+    else:
+        # 6to4 and Teredo carry routing/server addresses as well as the destination. A match
+        # in one component must not excuse a private destination in another component.
+        candidates = ()
     return any(
         candidate.version == network.version and candidate in network
-        for candidate in (ip, *_embedded_ipv4s(ip))
+        for candidate in candidates
         for network in networks
     )
 

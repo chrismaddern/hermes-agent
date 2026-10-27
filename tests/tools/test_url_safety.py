@@ -163,7 +163,13 @@ class TestProxyEnvironmentDnsDelegation:
         with _resolves_to("198.18.0.23"):
             assert is_safe_url(url) is expected
 
-    @pytest.mark.parametrize("ip", ["127.0.0.1", "10.0.0.1", "100.64.0.1", "fe80::1"])
+    @pytest.mark.parametrize("ip", [
+        "127.0.0.1",
+        "10.0.0.1",
+        "100.64.0.1",
+        "fe80::1",
+        "2001:0:c612:1:0:ffff:80ff:fffe",  # Teredo: public benchmark server + loopback client
+    ])
     def test_qq_multimedia_exception_rejects_non_benchmark_private_addresses(self, ip):
         with _resolves_to(ip):
             assert is_safe_url("https://multimedia.nt.qq.com.cn/download?id=123") is False
